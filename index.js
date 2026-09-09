@@ -52,6 +52,10 @@ function validUrl(u) {
     const h = x.hostname;
     if (!h.includes(".") || /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.|\[)/.test(h)) return null;
     if (h.endsWith(".workers.dev") && h.startsWith("watch.")) return null;
+    // Cloudflare refuses Worker->Worker fetches inside one account (error 1042),
+    // and a *.workers.dev target is on someone's account we can't know. Rather
+    // than sometimes report a live site as DOWN, decline these honestly.
+    if (h.endsWith(".workers.dev")) return "WORKERS_DEV";
     return x.toString();
   } catch { return null; }
 }
@@ -356,6 +360,8 @@ export default {
       else { const f = await request.formData().catch(() => null); if (f) body = Object.fromEntries(f.entries()); }
       const target = validUrl((body.url || "").trim());
       const email = (body.email || "").trim().toLowerCase();
+      if (target === "WORKERS_DEV")
+        return json({ error: "*.workers.dev URLs can't be monitored from a Worker (Cloudflare blocks Worker-to-Worker fetches, error 1042). Put a custom domain in front of it, or monitor something else." }, 400);
       if (!target) return json({ error: "url must be a public http(s) URL" }, 400);
       if (!validEmail(email)) return json({ error: "email looks invalid" }, 400);
       const ek = `e:${await sha(email)}`;
