@@ -15,7 +15,9 @@ omit and delete `/upgrade` if you only want the free monitor), `wrangler deploy`
 - A failed check is re-checked 20 s later; DOWN alert only if both fail (~1 min to alert, blips stay quiet). RECOVERED alert with downtime.
 - Above 20 monitors, each minute checks the 20 stalest, so the effective interval is `ceil(n/20)` min — stated honestly at `/stats`.
 - `GET /w/<token>` private status page; `POST /w/<token>/cancel` deletes the record
-- `GET /w/<token>/upgrade` → `402` with x402 v2 terms (5 USDC on Base or Polygon). Pay with any x402 wallet → 365 days.
+- Pay **either** way, both verified on-chain:
+  - plain transfer: send exactly 5 USDC (Base or Polygon) to the address on the status page, click *activate* (or wait — a cron binds unclaimed payments every 5 min)
+  - x402: `GET /w/<token>/upgrade` → `402` with v2 terms; pay with the header → instant
 - No SMTP in Workers, so alerts go through an HTTP mail API (AgentMail here; swap `sendMail`)
 - Abuse limits: public http(s) only, 3 monitors per email, honest `User-Agent`, 15s timeout
 - **Known limit:** `*.workers.dev` targets are refused — Cloudflare blocks Worker→Worker fetches (error 1042); refusing beats false-alarming. Custom domains are fine.
