@@ -573,6 +573,57 @@ export default {
       if (e) s.lastMailError = JSON.parse(e);
       return json(s);
     }
+    if (p === "/reliability/preview.json" || p === "/reliability.json") {
+      // Aggregate the hourly study into per-host uptime. Both populations.
+      let cursor; const samples = [];
+      do {
+        const page = await env.WATCH.list({ prefix: "study:", cursor, limit: 1000 });
+        cursor = page.list_complete ? undefined : page.cursor;
+        for (const k of page.keys) { const v = await env.WATCH.get(k.name); if (v) samples.push(JSON.parse(v)); }
+      } while (cursor);
+      const per = {};
+      for (const s of samples) for (const r of s.rows) {
+        const h = new URL(r.u).hostname; const o = per[h] || (per[h] = { host: h, url: r.u, n: 0, up: 0, ms: 0, codes: {} });
+        o.n++; o.up += r.up ? 1 : 0; o.ms += r.ms || 0; o.codes[r.c] = (o.codes[r.c] || 0) + 1;
+      }
+      const hosts = Object.values(per).map((o) => ({ ...o, uptime: o.n ? +(100 * o.up / o.n).toFixed(2) : null, avg_ms: o.n ? Math.round(o.ms / o.n) : null }))
+        .sort((a, b) => (b.uptime - a.uptime) || (a.avg_ms - b.avg_ms));
+      const body = { generated: new Date().toISOString(), hours_sampled: samples.length, hosts_tracked: hosts.length,
+        method: "Hourly GET, 15s timeout, from two collectors (Cloudflare edge for ~45 hosts/hour rotating; a fixed North-American vantage point for all ~495 hosts). up = HTTP<500 and not 404/410; 402/405/401/403 count as up (live server). Rows carry the raw status-code mix so you can apply your own definition.",
+        category_uptime: hosts.length ? +(100 * hosts.reduce((a, h) => a + h.up, 0) / Math.max(1, hosts.reduce((a, h) => a + h.n, 0))).toFixed(2) : null };
+      if (p.endsWith("preview.json")) {
+        return json({ ...body, preview: true, sample_hosts: hosts.slice(0, 5).map(({ host, uptime, avg_ms, n }) => ({ host, uptime, avg_ms, samples: n })),
+          full_dataset: `${env.PUBLIC_ORIGIN}/reliability.json`, price: "10 USDC via x402 (Base or Polygon), or email clankerceo@agentmail.to" });
+      }
+      // paid: x402, same facilitator path as /upgrade but a fixed resource
+      const hdr = request.headers.get("x-payment") || request.headers.get("payment-signature");
+      const reqs = Object.entries(USDC).map(([network, asset]) => ({ scheme: "exact", network, asset, amount: "10000000", maxAmountRequired: "10000000",
+        payTo: env.PAY_TO_BASE, maxTimeoutSeconds: 300, resource: `${env.PUBLIC_ORIGIN}/reliability.json`,
+        description: "Hourly-measured uptime for ~500 x402/agent-infra hosts, per host, with status-code mix. Updated continuously.", mimeType: "application/json", extra: { name: "USD Coin", version: "2" } }));
+      if (!hdr) {
+        const ch = { x402Version: 2, error: "Payment required: 10 USDC for the full per-host reliability dataset", accepts: reqs };
+        return json(ch, 402, { "payment-required": btoa(unescape(encodeURIComponent(JSON.stringify(ch)))), "access-control-expose-headers": "payment-required" });
+      }
+      let payload; try { payload = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(hdr), (c) => c.charCodeAt(0)))); } catch { return json({ error: "malformed payment header" }, 400); }
+      const rq = reqs.find((x) => x.network === payload?.network) || reqs[0];
+      const v = await facilitator(env, "verify", { x402Version: 2, paymentPayload: payload, paymentRequirements: rq });
+      if (!v.ok || v.data?.isValid === false) return json({ error: "payment not valid", detail: v.data?.invalidReason || v.data }, 402);
+      const s = await facilitator(env, "settle", { x402Version: 2, paymentPayload: payload, paymentRequirements: rq });
+      if (!s.ok || s.data?.success === false) return json({ error: "settlement failed", detail: s.data?.errorReason || s.data }, 402);
+      await bump(env, "dataset_paid"); await bump(env, "revenue_cents", 1000);
+      if (s.data?.transaction) await env.WATCH.put(`tx:${s.data.transaction}`, JSON.stringify({ dataset: true, at: Date.now() }));
+      return json({ ...body, hosts }, 200, { "payment-response": btoa(JSON.stringify({ success: true, transaction: s.data?.transaction, network: s.data?.network })) });
+    }
+    if (p === "/study/ingest" && request.method === "POST") {
+      // Local probe (495 URLs/hour, but the host PC sleeps) pushes its rows here
+      // so the paid dataset is the union of both collectors. Bearer = INGEST_KEY.
+      if ((request.headers.get("authorization") || "") !== `Bearer ${env.INGEST_KEY}`) return json({ error: "no" }, 401);
+      const b = await request.json().catch(() => null);
+      if (!b || !b.hour || !Array.isArray(b.rows)) return json({ error: "need {hour, rows[]}" }, 400);
+      const rows = b.rows.slice(0, 1000).map((r) => ({ u: String(r.u).slice(0, 300), c: +r.c || 0, ms: +r.ms || 0, up: !!r.up }));
+      await env.WATCH.put(`study:${b.hour}:local`, JSON.stringify({ hour: b.hour, n: rows.length, up: rows.filter((x) => x.up).length, rows, src: "local" }), { expirationTtl: 60 * 86400 });
+      return json({ ok: true, stored: rows.length });
+    }
     if (p === "/study.json") {
       let cursor; const out = [];
       do {
