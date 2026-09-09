@@ -93,7 +93,11 @@ async function checkOnce(target) {
     clearTimeout(tm);
     await r.arrayBuffer(); // drain
     const ms = Date.now() - t0;
-    return { up: r.status < 500 && r.status !== 0, status: r.status, ms };
+    // Down = server error, no response, or the page is gone (404/410). A
+    // 401/403 is a live server saying no, so it counts as up. The demo
+    // monitor showed "UP (HTTP 404)" and that is not what anyone means by up.
+    const up = r.status !== 0 && r.status < 500 && r.status !== 404 && r.status !== 410;
+    return { up, status: r.status, ms };
   } catch (e) {
     return { up: false, status: 0, ms: Date.now() - t0, error: String(e?.message || e).slice(0, 120) };
   }
@@ -261,16 +265,18 @@ code{background:#f2f2f2;padding:2px 5px;border-radius:4px}.small{color:#666;font
 function landing(env, stats) {
   return html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>watch — uptime monitoring with no account</title><style>${CSS}</style></head><body>
-<h1>watch</h1><p class="sub">Uptime + downtime alerts for one URL. No account, no card, no login. Free for 7 days, then $5 once for a year — paid with a crypto wallet, or don't and it just stops.</p>
+<h1>watch</h1><p class="sub">Uptime + downtime alerts for one URL. No account, no card, no login, nothing to install. Free for 7 days — no wallet, no crypto, no catch. Then it stops, unless you want a year.</p>
 <form class="box" method="post" action="/watch">
 <label>URL to watch<input name="url" type="url" required placeholder="https://example.com/health"></label>
 <label>Email for alerts<input name="email" type="email" required placeholder="you@example.com"></label>
 <button type="submit">Start watching (free, 7 days)</button>
 <p class="small">Checked every 5 minutes from Cloudflare's edge. Alert after 2 consecutive failures, again on recovery. One confirmation email, no marketing, ever. Cancel link in every email.</p>
 </form>
-<div class="box"><b>Why this exists.</b> Every uptime service wants an account, a card on file and a monthly plan, and the free tiers shrink every year. This is the opposite: give it a URL and an email, get alerts. If after a week you want it to keep going, it's <b>$5 USDC once</b> (Base or Polygon, via <a href="https://x402.org">x402</a>). No renewal, no upsell.</div>
+<div class="box"><b>Why this exists.</b> Every uptime service wants an account, a card on file and a monthly plan, and the free tiers shrink every year. This is the opposite: give it a URL and an email, get alerts. That's it.</div>
+<div class="box"><b>Live example.</b> This service watches its own sibling API: <a href="/demo">see the public status of the monitor that's been running the longest</a> — real checks, real timestamps, nothing staged.</div>
+<p class="small"><b>After the week:</b> it just stops and you get one email saying so. If you want a year, it's $5 <i>once</i>, paid with a USDC wallet via <a href="https://x402.org">x402</a> — no card, no account, no renewal. If that's not your thing, the free week is still the free week.</p>
 <p class="small">Currently watching <b>${stats.active || 0}</b> URL${stats.active === 1 ? "" : "s"} · ${stats.checks || 0} checks run · ${stats.alerts || 0} alerts sent.<br>
-Run by <a href="https://github.com/clankerceo">clankerceo</a>, an autonomous agent. Questions: clankerceo@agentmail.to · <a href="/api">API</a></p>
+Run by <a href="https://github.com/clankerceo">clankerceo</a>, an autonomous agent. <a href="https://github.com/clankerceo/watch">Source</a> · <a href="/api">API</a> · clankerceo@agentmail.to</p>
 </body></html>`);
 }
 
@@ -283,11 +289,11 @@ function statusPage(env, m) {
 <div class="box">Status: <b>${st}</b><br>Last check: ${m.lastCheck ? new Date(m.lastCheck).toISOString() : "—"} ${m.lastStatus ? `(HTTP ${m.lastStatus}, ${m.lastMs} ms)` : ""}<br>
 Checks: ${m.checks || 0} · Failed: ${m.downCount || 0} · Incidents: ${m.incidents || 0}<br>
 Plan: <b>${m.paid ? "paid, 1 year" : "free trial"}</b> · ${left} day${left === 1 ? "" : "s"} left · alerts to ${esc(m.email)}</div>
-${m.paid ? "" : `<div class="box"><b>Keep it running for a year — $5 USDC, once.</b><br>
+${m.demo ? `<div class="box">This is the public demo view of a real monitor. <a href="/">Start your own</a> — free, no account.</div>` : m.paid ? "" : `<div class="box"><b>Keep it running for a year — $5 USDC, once.</b><br>
 <p class="small">Any x402-capable wallet or agent: <code>GET ${esc(env.PUBLIC_ORIGIN)}/w/${m.token}/upgrade</code> returns the payment terms (Base or Polygon USDC). Pay it and this monitor runs until ${new Date(Date.now() + PAID_DAYS * 86400000).toISOString().slice(0, 10)}. No account is created.</p>
 <p class="small">No wallet? Just let the trial end. You'll get exactly one email saying it stopped.</p></div>`}
-<form method="post" action="/w/${m.token}/cancel" onsubmit="return confirm('Stop monitoring and delete this?')"><button type="submit" style="background:#fff;color:#b3261e;border-color:#b3261e">Cancel &amp; delete</button></form>
-<p class="small">This page is private to whoever holds the link. <a href="/">watch</a></p></body></html>`);
+${m.demo ? "" : `<form method="post" action="/w/${m.token}/cancel" onsubmit="return confirm('Stop monitoring and delete this?')"><button type="submit" style="background:#fff;color:#b3261e;border-color:#b3261e">Cancel &amp; delete</button></form>
+<p class="small">This page is private to whoever holds the link. <a href="/">watch</a></p>`}</body></html>`);
 }
 
 const API_DOC = (o) => `watch API
@@ -318,6 +324,23 @@ export default {
     if (p === "/" ) return landing(env, JSON.parse((await env.WATCH.get("stats")) || "{}"));
     if (p === "/api") return new Response(API_DOC(env.PUBLIC_ORIGIN), { headers: { "content-type": "text/plain" } });
     if (p === "/health") return json({ ok: true, service: "watch", time: new Date().toISOString() });
+    if (p === "/demo") {
+      // Public, read-only view of the longest-running monitor (mine). Same
+      // renderer as the private page, but no cancel/upgrade controls and the
+      // email masked, so nothing here is a secret.
+      let oldest = null, cursor;
+      do {
+        const page = await env.WATCH.list({ prefix: "w:", cursor, limit: 200 });
+        cursor = page.list_complete ? undefined : page.cursor;
+        for (const k of page.keys) {
+          const m = JSON.parse((await env.WATCH.get(k.name)) || "null");
+          if (m && (!oldest || m.createdAt < oldest.createdAt)) oldest = m;
+        }
+      } while (cursor);
+      if (!oldest) return json({ error: "no monitors yet" }, 404);
+      const d = { ...oldest, email: oldest.email.replace(/^(.).*(@.*)$/, "$1***$2"), demo: true };
+      return statusPage(env, d);
+    }
     if (p === "/stats") {
       const s = JSON.parse((await env.WATCH.get("stats")) || "{}");
       const e = await env.WATCH.get("lastMailError");
