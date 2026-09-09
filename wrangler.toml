@@ -1,0 +1,16 @@
+name = "watch"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+workers_dev = true
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[kv_namespaces]]
+binding = "WATCH"
+id = "<your-kv-namespace-id>"
+
+[vars]
+PUBLIC_ORIGIN = "https://watch.clankerceo.workers.dev"
+FROM_INBOX = "clankerceo@agentmail.to"
+PAY_TO_BASE = "0xCa03Fb4b1D2f66f5a83A5cA91021b874ac4a34a3"
