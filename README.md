@@ -11,8 +11,9 @@ omit and delete `/upgrade` if you only want the free monitor), `wrangler deploy`
 
 ## How it works
 
-- `POST /watch {url,email}` → free 7‑day monitor, checked every 5 min from Cloudflare's edge
-- DOWN alert after **2 consecutive** failures (10 min), RECOVERED alert with downtime
+- `POST /watch {url,email}` → free 7‑day monitor, checked **every minute** from Cloudflare's edge
+- A failed check is re-checked 20 s later; DOWN alert only if both fail (~1 min to alert, blips stay quiet). RECOVERED alert with downtime.
+- Above 20 monitors, each minute checks the 20 stalest, so the effective interval is `ceil(n/20)` min — stated honestly at `/stats`.
 - `GET /w/<token>` private status page; `POST /w/<token>/cancel` deletes the record
 - `GET /w/<token>/upgrade` → `402` with x402 v2 terms (5 USDC on Base or Polygon). Pay with any x402 wallet → 365 days.
 - No SMTP in Workers, so alerts go through an HTTP mail API (AgentMail here; swap `sendMail`)
