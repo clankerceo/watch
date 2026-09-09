@@ -270,6 +270,7 @@ async function handleUpgrade(request, env, tok, m, key) {
     return json({ error: "settlement failed", detail: s.data?.errorReason || s.data }, 402);
   const now = Date.now();
   m.paid = true; m.paidAt = now; m.tx = s.data?.transaction || null; m.network = s.data?.network || req.network;
+  if (m.tx) await env.WATCH.put(`tx:${m.tx}`, JSON.stringify({ token: tok, at: now, network: m.network, via: "x402" }));
   m.expiresAt = Math.max(m.expiresAt || now, now) + PAID_DAYS * 86400000; m.expiredNotified = false;
   await env.WATCH.put(key, JSON.stringify(m));
   await bump(env, "paid"); await bump(env, "revenue_cents", 500);
@@ -278,6 +279,93 @@ async function handleUpgrade(request, env, tok, m, key) {
     `Status/cancel: ${env.PUBLIC_ORIGIN}/w/${m.token}\n`);
   return json({ ok: true, paid: true, expiresAt: new Date(m.expiresAt).toISOString(), tx: m.tx },
     200, { "payment-response": btoa(JSON.stringify({ success: true, transaction: m.tx, network: m.network })) });
+}
+
+// ---------- plain-transfer claim (no x402 client needed) ----------
+// A human sends exactly 5 USDC to PAY_TO from any wallet/exchange, then clicks
+// "activate". We scan ERC-20 Transfer logs to PAY_TO on both chains since the
+// monitor was created, take the first 5.00 USDC transfer whose tx hash has
+// not been claimed by any monitor, and bind it. First-come-first-served is
+// fair here: the sender got a monitor for their money, and nobody who did
+// not pay can claim (they'd need an unclaimed 5 USDC transfer to exist).
+const RPC = {
+  "eip155:8453": ["https://mainnet.base.org", "https://base-rpc.publicnode.com", "https://base.drpc.org"],
+  "eip155:137": ["https://polygon-bor-rpc.publicnode.com", "https://polygon.drpc.org"],
+};
+const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+// Public RPCs cap eth_getLogs at 10k blocks (publicnode/drpc; 1rpc is 50!).
+// Scan in 9k windows newest-first. 8 windows = 72k blocks ≈ 40h on Base (2s)
+// and ≈ 44h on Polygon (2.2s); a paying human clicks within that.
+const WINDOW = 9000, WINDOWS = 8;
+
+async function rpcCall(urls, method, params) {
+  let err;
+  for (const u of urls) {
+    try {
+      const r = await fetch(u, { method: "POST", headers: { "content-type": "application/json", "user-agent": UA },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+      const j = await r.json();
+      if (j.error) throw new Error(j.error.message);
+      return j.result;
+    } catch (e) { err = e; }
+  }
+  throw err || new Error("all rpcs failed");
+}
+
+async function findUnclaimedPayment(env, sinceMs) {
+  const padded = "0x" + env.PAY_TO_BASE.slice(2).toLowerCase().padStart(64, "0");
+  for (const [network, asset] of Object.entries(USDC)) {
+    const urls = RPC[network];
+    let logs = [];
+    try {
+      const latest = parseInt(await rpcCall(urls, "eth_blockNumber", []), 16);
+      for (let w = 0; w < WINDOWS; w++) {
+        const to = latest - w * WINDOW, from = Math.max(0, to - WINDOW + 1);
+        const part = await rpcCall(urls, "eth_getLogs", [{ address: asset, fromBlock: "0x" + from.toString(16),
+          toBlock: "0x" + to.toString(16), topics: [TRANSFER_TOPIC, null, padded] }]);
+        logs.push(...(part || []).reverse());   // newest first overall
+        if (logs.some((l) => parseInt(l.data, 16) === 5000000)) break; // found candidates; stop paging
+      }
+    } catch (e) { await env.WATCH.put("lastScanError", JSON.stringify({ network, at: new Date().toISOString(), err: String(e?.message || e).slice(0, 200) })); continue; }
+    for (const lg of logs) {
+      const value = parseInt(lg.data, 16);
+      if (value !== 5000000) continue;
+      const key = `tx:${lg.transactionHash}`;
+      if (await env.WATCH.get(key)) continue;           // already bound to a monitor
+      // block timestamp so a transfer from before the monitor existed can't be claimed
+      let ts = 0;
+      try { const b = await rpcCall(urls, "eth_getBlockByNumber", [lg.blockNumber, false]); ts = parseInt(b.timestamp, 16) * 1000; } catch {}
+      if (ts && ts < sinceMs - 3600000) continue;
+      return { tx: lg.transactionHash, network, from: "0x" + lg.topics[1].slice(26), ts };
+    }
+  }
+  return null;
+}
+
+async function handleClaim(env, tok, m, key) {
+  if (m.paid) return Response.redirect(`${env.PUBLIC_ORIGIN}/w/${tok}`, 303);
+  const hit = await findUnclaimedPayment(env, m.createdAt);
+  if (!hit) {
+    return html(`<!doctype html><meta charset="utf-8"><style>${CSS}</style><h1>Not seen yet</h1>
+<p>No unclaimed 5 USDC transfer to <code>${env.PAY_TO_BASE}</code> on Base or Polygon since this monitor was created.</p>
+<ul class="small"><li>Transfers usually confirm in under a minute — wait 60 seconds and try again.</li>
+<li>It must be <b>exactly 5 USDC</b> (not 4.99 after fees, not 5 USDT).</li>
+<li>Base and Polygon only. Ethereum mainnet, Arbitrum, Solana etc. are not scanned.</li></ul>
+<p><a href="/w/${tok}">Back</a> · <a href="/w/${tok}/claim" onclick="event.preventDefault();fetch('/w/${tok}/claim',{method:'POST'}).then(()=>location.reload())">Try again</a> · questions: clankerceo@agentmail.to</p>`, 404);
+  }
+  await handleClaimHit(env, key, m, hit);
+  return Response.redirect(`${env.PUBLIC_ORIGIN}/w/${tok}`, 303);
+}
+
+async function handleClaimHit(env, key, m, hit) {
+  const now = Date.now();
+  await env.WATCH.put(`tx:${hit.tx}`, JSON.stringify({ token: m.token, at: now, network: hit.network }));
+  m.paid = true; m.paidAt = now; m.tx = hit.tx; m.network = hit.network; m.paidVia = "transfer"; m.payer = hit.from;
+  m.expiresAt = Math.max(m.expiresAt || now, now) + PAID_DAYS * 86400000; m.expiredNotified = false;
+  await env.WATCH.put(key, JSON.stringify(m));
+  await bump(env, "paid"); await bump(env, "revenue_cents", 500);
+  await sendMail(env, m.email, `[watch] paid — ${m.host} monitored until ${new Date(m.expiresAt).toISOString().slice(0, 10)}`,
+    `Thanks. 5 USDC received (tx ${hit.tx} on ${hit.network}).\n${m.url} is monitored every minute for a year.\n\nStatus/cancel: ${env.PUBLIC_ORIGIN}/w/${m.token}\n`);
 }
 
 // ---------- pages ----------
@@ -314,9 +402,13 @@ function statusPage(env, m) {
 <div class="box">Status: <b>${st}</b><br>Last check: ${m.lastCheck ? new Date(m.lastCheck).toISOString() : "—"} ${m.lastStatus ? `(HTTP ${m.lastStatus}, ${m.lastMs} ms)` : ""}<br>
 Checks: ${m.checks || 0} · Failed: ${m.downCount || 0} · Incidents: ${m.incidents || 0}<br>
 Plan: <b>${m.paid ? "paid, 1 year" : "free trial"}</b> · ${left} day${left === 1 ? "" : "s"} left · alerts to ${esc(m.email)}</div>
-${m.demo ? `<div class="box">This is the public demo view of a real monitor. <a href="/">Start your own</a> — free, no account.</div>` : m.paid ? "" : `<div class="box"><b>Keep it running for a year — $5 USDC, once.</b><br>
-<p class="small">Any x402-capable wallet or agent: <code>GET ${esc(env.PUBLIC_ORIGIN)}/w/${m.token}/upgrade</code> returns the payment terms (Base or Polygon USDC). Pay it and this monitor runs until ${new Date(Date.now() + PAID_DAYS * 86400000).toISOString().slice(0, 10)}. No account is created.</p>
-<p class="small">No wallet? Just let the trial end. You'll get exactly one email saying it stopped.</p></div>`}
+${m.demo ? `<div class="box">This is the public demo view of a real monitor. <a href="/">Start your own</a> — free, no account.</div>` : m.paid ? "" : `<div class="box"><b>Keep it running for a year — $5, once.</b>
+<p class="small">Send <b>exactly 5 USDC</b> on <b>Base</b> or <b>Polygon</b> to this address, then click the button. Any exchange or wallet that can send USDC works (Coinbase, Binance, MetaMask, Phantom, Rabby…). No account is created here.</p>
+<p><code id="addr" style="font-size:13px;word-break:break-all">${env.PAY_TO_BASE}</code> <button type="button" onclick="navigator.clipboard.writeText('${env.PAY_TO_BASE}');this.textContent='copied'" style="padding:4px 10px;font-size:13px">copy</button></p>
+<form method="post" action="/w/${m.token}/claim"><button type="submit">I've sent 5 USDC — activate my year</button></form>
+<p class="small" id="claimnote"></p>
+<details class="small"><summary>Using an x402 wallet or an agent instead?</summary><code>GET ${esc(env.PUBLIC_ORIGIN)}/w/${m.token}/upgrade</code> returns x402 v2 payment terms; pay with the header and it activates instantly.</details>
+<p class="small">No wallet, no crypto? Just let the trial end. You'll get exactly one email saying it stopped — nothing else, ever.</p></div>`}
 ${m.demo ? "" : `<form method="post" action="/w/${m.token}/cancel" onsubmit="return confirm('Stop monitoring and delete this?')"><button type="submit" style="background:#fff;color:#b3261e;border-color:#b3261e">Cancel &amp; delete</button></form>
 <p class="small">This page is private to whoever holds the link. <a href="/">watch</a></p>`}</body></html>`);
 }
@@ -333,10 +425,33 @@ GET  ${o}/w/<token>/upgrade
 GET  ${o}/stats           public counters
 `;
 
+async function autoClaim(env) {
+  // Every 5th minute: if someone paid by plain transfer and never clicked
+  // "activate", bind the payment to the OLDEST unpaid trial monitor created
+  // before the transfer. Same rule as the button, just without the button.
+  if (new Date().getMinutes() % 5) return;
+  let cursor; const unpaid = [];
+  do {
+    const page = await env.WATCH.list({ prefix: "w:", cursor, limit: 1000 });
+    cursor = page.list_complete ? undefined : page.cursor;
+    for (const k of page.keys) {
+      const m = JSON.parse((await env.WATCH.get(k.name)) || "null");
+      if (m && !m.paid && m.expiresAt > Date.now() - 7 * 86400000) unpaid.push([k.name, m]);
+    }
+  } while (cursor);
+  if (!unpaid.length) return;
+  unpaid.sort((a, b) => a[1].createdAt - b[1].createdAt);
+  const hit = await findUnclaimedPayment(env, unpaid[0][1].createdAt);
+  if (!hit) return;
+  const [key, m] = unpaid.find(([, mm]) => mm.createdAt <= (hit.ts || Infinity)) || unpaid[0];
+  await handleClaimHit(env, key, m, hit);
+}
+
 export default {
   async scheduled(event, env, ctx) {
     const n = await runAll(env);
     await bump(env, "checks", n);
+    ctx.waitUntil(autoClaim(env).catch(() => {}));
   },
 
   async fetch(request, env, ctx) {
@@ -407,7 +522,7 @@ export default {
       return Response.redirect(status_url, 303);
     }
 
-    const mm = p.match(/^\/w\/([a-f0-9]{32})(\.json|\/cancel|\/upgrade)?$/);
+    const mm = p.match(/^\/w\/([a-f0-9]{32})(\.json|\/cancel|\/upgrade|\/claim)?$/);
     if (mm) {
       const tok = mm[1], key = `w:${tok}`;
       const raw = await env.WATCH.get(key);
@@ -422,6 +537,7 @@ export default {
         return html(`<!doctype html><meta charset="utf-8"><style>${CSS}</style><h1>Deleted.</h1><p>${esc(m.url)} is no longer monitored and its record is gone.</p><p><a href="/">watch</a></p>`);
       }
       if (mm[2] === "/upgrade") return handleUpgrade(request, env, tok, m, key);
+      if (mm[2] === "/claim" && request.method === "POST") return handleClaim(env, tok, m, key);
       if (mm[2] === ".json") { const { email, ...pub } = m; return json({ ...pub, email: email.replace(/^(.).*(@.*)$/, "$1***$2") }); }
       return statusPage(env, m);
     }
