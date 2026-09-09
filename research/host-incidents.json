@@ -1,0 +1,317 @@
+{
+ "generated": "2026-09-09T02:48:53.038305+00:00",
+ "method": "statuspage.io /api/v2/incidents.json, paginated; durations only for resolved incidents; 'major' = impact in {major,critical}",
+ "rows": [
+  {
+   "host": "Vercel",
+   "source": "https://www.vercel-status.com/api/v2/incidents.json",
+   "pages": 1,
+   "d30": {
+    "incidents": 9,
+    "resolved": 9,
+    "major_or_critical": 4,
+    "major_minutes_resolved": 200,
+    "worst_major": [
+     82.32613333333333,
+     "Failures logging in with Vercel CLI",
+     "2026-08-26"
+    ],
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 31,
+    "resolved": 31,
+    "major_or_critical": 11,
+    "major_minutes_resolved": 1171,
+    "worst_major": [
+     358.36825000000005,
+     "Increase in Workflow runs stuck as pending",
+     "2026-06-25"
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "host": "Fly.io",
+   "source": "https://status.flyio.net/api/v2/incidents.json",
+   "pages": 7,
+   "d30": {
+    "incidents": 18,
+    "resolved": 18,
+    "major_or_critical": 4,
+    "major_minutes_resolved": 160,
+    "worst_major": [
+     63.025333333333336,
+     "Secrets service outage",
+     "2026-08-14"
+    ],
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 50,
+    "resolved": 50,
+    "major_or_critical": 18,
+    "major_minutes_resolved": 6332,
+    "worst_major": [
+     2716.797266666667,
+     "Delayed Metrics",
+     "2026-06-29"
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "host": "Render",
+   "source": "https://status.render.com/api/v2/incidents.json",
+   "pages": 1,
+   "d30": {
+    "incidents": 4,
+    "resolved": 4,
+    "major_or_critical": 3,
+    "major_minutes_resolved": 396,
+    "worst_major": [
+     233.30409999999998,
+     "Deployment Issues",
+     "2026-08-20"
+    ],
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 19,
+    "resolved": 19,
+    "major_or_critical": 9,
+    "major_minutes_resolved": 1083,
+    "worst_major": [
+     336.46661666666665,
+     "GitHub git clone 403 errors",
+     "2026-07-19"
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "host": "Netlify",
+   "source": "https://www.netlifystatus.com/api/v2/incidents.json",
+   "pages": 1,
+   "d30": {
+    "incidents": 4,
+    "resolved": 4,
+    "major_or_critical": 1,
+    "major_minutes_resolved": 0,
+    "worst_major": [
+     0.0,
+     "Elevated HTTP 500 errors serving sites and the Netlify UI",
+     "2026-08-18"
+    ],
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 9,
+    "resolved": 9,
+    "major_or_critical": 2,
+    "major_minutes_resolved": 25,
+    "worst_major": [
+     24.733366666666665,
+     "Elevated Build Errors",
+     "2026-08-03"
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "host": "Cloudflare",
+   "source": "https://www.cloudflarestatus.com/api/v2/incidents.json",
+   "pages": 7,
+   "d30": {
+    "incidents": 50,
+    "resolved": 49,
+    "major_or_critical": 1,
+    "major_minutes_resolved": 19,
+    "worst_major": [
+     18.587750000000003,
+     "Network Route Leak in Palmas, Brazil",
+     "2026-09-01"
+    ],
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 50,
+    "resolved": 49,
+    "major_or_critical": 1,
+    "major_minutes_resolved": 19,
+    "worst_major": [
+     18.587750000000003,
+     "Network Route Leak in Palmas, Brazil",
+     "2026-09-01"
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "host": "Supabase",
+   "source": "https://status.supabase.com/api/v2/incidents.json",
+   "pages": 7,
+   "d30": {
+    "incidents": 17,
+    "resolved": 15,
+    "major_or_critical": 7,
+    "major_minutes_resolved": 6621,
+    "worst_major": [
+     5676.8318,
+     "Increased response times for requests",
+     "2026-08-27"
+    ],
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 50,
+    "resolved": 48,
+    "major_or_critical": 14,
+    "major_minutes_resolved": 28435,
+    "worst_major": [
+     19521.9765,
+     "Project status change failures in multiple regions",
+     "2026-06-30"
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "host": "DigitalOcean",
+   "source": "https://status.digitalocean.com/api/v2/incidents.json",
+   "pages": 1,
+   "d30": {
+    "incidents": 5,
+    "resolved": 5,
+    "major_or_critical": 2,
+    "major_minutes_resolved": 2055,
+    "worst_major": [
+     1549.8231666666666,
+     "Cloud Control Panel and API",
+     "2026-08-24"
+    ],
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 31,
+    "resolved": 31,
+    "major_or_critical": 5,
+    "major_minutes_resolved": 3665,
+    "worst_major": [
+     1549.8231666666666,
+     "Cloud Control Panel and API",
+     "2026-08-24"
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "host": "GitHub",
+   "source": "https://www.githubstatus.com/api/v2/incidents.json",
+   "pages": 7,
+   "d30": {
+    "incidents": 25,
+    "resolved": 25,
+    "major_or_critical": 8,
+    "major_minutes_resolved": 1626,
+    "worst_major": [
+     594.31155,
+     "Intermittent failures creating agent tasks",
+     "2026-08-20"
+    ],
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 50,
+    "resolved": 50,
+    "major_or_critical": 20,
+    "major_minutes_resolved": 3350,
+    "worst_major": [
+     641.9238499999999,
+     "Incident with Actions",
+     "2026-08-06"
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "host": "PlanetScale",
+   "source": "https://www.planetscalestatus.com/api/v2/incidents.json",
+   "pages": 1,
+   "d30": {
+    "incidents": 2,
+    "resolved": 2,
+    "major_or_critical": 2,
+    "major_minutes_resolved": 24,
+    "worst_major": [
+     14.233333333333333,
+     "Connectivity issues with Vitess databases in GCP",
+     "2026-09-05"
+    ],
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 8,
+    "resolved": 8,
+    "major_or_critical": 5,
+    "major_minutes_resolved": 265,
+    "worst_major": [
+     180.26666666666668,
+     "Insights metrics underreporting",
+     "2026-07-24"
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "host": "Upstash",
+   "source": "https://status.upstash.com/api/v2/incidents.json",
+   "pages": 1,
+   "d30": {
+    "incidents": 2,
+    "resolved": 2,
+    "major_or_critical": 1,
+    "major_minutes_resolved": 0,
+    "worst_major": [
+     0.0,
+     "Message Persistence Issue \u2014 QStash us-east-1",
+     "2026-08-28"
+    ],
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 8,
+    "resolved": 8,
+    "major_or_critical": 3,
+    "major_minutes_resolved": 72,
+    "worst_major": [
+     72.27073333333333,
+     "Upstash Redis Partial Service Disruption",
+     "2026-06-25"
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "host": "Linode",
+   "source": "https://status.linode.com/api/v2/incidents.json",
+   "pages": 1,
+   "d30": {
+    "incidents": 10,
+    "resolved": 10,
+    "major_or_critical": 0,
+    "major_minutes_resolved": 0,
+    "worst_major": null,
+    "truncated": false
+   },
+   "d90": {
+    "incidents": 29,
+    "resolved": 29,
+    "major_or_critical": 0,
+    "major_minutes_resolved": 0,
+    "worst_major": null,
+    "truncated": false
+   }
+  }
+ ]
+}
