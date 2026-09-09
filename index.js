@@ -1,6 +1,6 @@
 // watch — uptime + SSL-expiry monitoring with no account.
 //
-// POST /watch {url,email}  -> free 7-day trial, checked every 5 min from CF edge
+// POST /watch {url,email}  -> free 7-day trial, checked every minute from CF edge
 // GET  /w/<token>          -> status page (+ cancel, + upgrade)
 // POST /w/<token>/cancel   -> stop and delete
 // GET  /w/<token>/upgrade  -> 402: pay $5 USDC once (Base or Polygon), 1 year
@@ -135,8 +135,20 @@ async function processMonitor(env, key, m) {
     }
     return;
   }
-  const res = await checkOnce(m.url);
+  let res = await checkOnce(m.url);
   m.checks = (m.checks || 0) + 1;
+  // Confirm a failure immediately instead of waiting for the next tick: the
+  // #1 complaint about free monitors (r/devops, 88 comments) is that a 5-min
+  // interval + 2-strike rule means 10+ minutes to hear about an outage.
+  // One retry after 20s turns "two ticks" into "~20 seconds" while still
+  // filtering single-request blips.
+  if (!res.up) {
+    await new Promise((r) => setTimeout(r, 20000));
+    const again = await checkOnce(m.url);
+    m.checks++;
+    if (again.up) res = again;           // blip: treat as up
+    else res = { ...again, confirmed: true };
+  }
   m.lastCheck = now; m.lastStatus = res.status; m.lastMs = res.ms;
   if (!res.up) {
     m.failStreak = (m.failStreak || 0) + 1;
@@ -144,12 +156,11 @@ async function processMonitor(env, key, m) {
   } else {
     m.failStreak = 0;
   }
-  // Alert on 2 consecutive failures (10 min) to avoid single-blip noise.
-  if (!res.up && m.failStreak === 2 && m.state !== "down") {
+  if (res.confirmed && m.state !== "down") {
     m.state = "down"; m.downSince = now; m.incidents = (m.incidents || 0) + 1;
     await bump(env, "alerts");
     await sendMail(env, m.email, `[watch] DOWN: ${m.host}`,
-      `${m.url} has failed 2 checks in a row.\n` +
+      `${m.url} failed a check and failed again 20 seconds later.\n` +
       `Last result: HTTP ${res.status || "no response"}${res.error ? " — " + res.error : ""} (${res.ms} ms)\n` +
       `Checked from Cloudflare's edge at ${new Date(now).toISOString()}.\n\n` +
       `Status/cancel: ${env.PUBLIC_ORIGIN}/w/${m.token}\n`);
@@ -166,23 +177,33 @@ async function processMonitor(env, key, m) {
   await env.WATCH.put(key, JSON.stringify(m));
 }
 
+// Free-plan Workers allow ~50 subrequests per invocation and each monitor
+// needs up to 2 (check + retry) plus KV I/O. Above ~20 monitors, rotate:
+// each minute handles the slice that is due, ordered by staleness, so every
+// monitor is still checked within a few minutes and none is silently skipped.
+const PER_TICK = 20;
 async function runAll(env) {
-  let cursor, n = 0;
+  let cursor; const all = [];
   do {
-    const page = await env.WATCH.list({ prefix: "w:", cursor, limit: 200 });
+    const page = await env.WATCH.list({ prefix: "w:", cursor, limit: 1000 });
     cursor = page.list_complete ? undefined : page.cursor;
-    const jobs = [];
-    for (const k of page.keys) {
-      jobs.push((async () => {
-        const raw = await env.WATCH.get(k.name);
-        if (!raw) return;
-        await processMonitor(env, k.name, JSON.parse(raw));
-        n++;
-      })());
-    }
-    await Promise.allSettled(jobs);
+    for (const k of page.keys) all.push(k.name);
   } while (cursor);
-  return n;
+  if (all.length <= PER_TICK) {
+    await Promise.allSettled(all.map(async (k) => {
+      const raw = await env.WATCH.get(k); if (raw) await processMonitor(env, k, JSON.parse(raw)); }));
+    return all.length;
+  }
+  // Too many for one tick: load lastCheck for all (KV reads are cheap and
+  // not counted as subrequests), pick the PER_TICK stalest.
+  const recs = (await Promise.all(all.map(async (k) => {
+    const raw = await env.WATCH.get(k); return raw ? [k, JSON.parse(raw)] : null; }))).filter(Boolean);
+  recs.sort((a, b) => (a[1].lastCheck || 0) - (b[1].lastCheck || 0));
+  const due = recs.slice(0, PER_TICK);
+  await Promise.allSettled(due.map(([k, m]) => processMonitor(env, k, m)));
+  await env.WATCH.put("stats:backlog", JSON.stringify({ monitors: recs.length, perTick: PER_TICK,
+    effectiveIntervalMin: Math.ceil(recs.length / PER_TICK) }));
+  return due.length;
 }
 
 async function bump(env, field, by = 1) {
@@ -253,7 +274,7 @@ async function handleUpgrade(request, env, tok, m, key) {
   await env.WATCH.put(key, JSON.stringify(m));
   await bump(env, "paid"); await bump(env, "revenue_cents", 500);
   await sendMail(env, m.email, `[watch] paid — ${m.host} monitored until ${new Date(m.expiresAt).toISOString().slice(0, 10)}`,
-    `Thanks. $5 USDC received${m.tx ? ` (tx ${m.tx})` : ""}.\n${m.url} is monitored every 5 minutes for a year.\n\n` +
+    `Thanks. $5 USDC received${m.tx ? ` (tx ${m.tx})` : ""}.\n${m.url} is monitored every minute for a year.\n\n` +
     `Status/cancel: ${env.PUBLIC_ORIGIN}/w/${m.token}\n`);
   return json({ ok: true, paid: true, expiresAt: new Date(m.expiresAt).toISOString(), tx: m.tx },
     200, { "payment-response": btoa(JSON.stringify({ success: true, transaction: m.tx, network: m.network })) });
@@ -274,7 +295,7 @@ function landing(env, stats) {
 <label>URL to watch<input name="url" type="url" required placeholder="https://example.com/health"></label>
 <label>Email for alerts<input name="email" type="email" required placeholder="you@example.com"></label>
 <button type="submit">Start watching (free, 7 days)</button>
-<p class="small">Checked every 5 minutes from Cloudflare's edge. Alert after 2 consecutive failures, again on recovery. One confirmation email, no marketing, ever. Cancel link in every email.</p>
+<p class="small">Checked <b>every minute</b> from Cloudflare's edge. A failure is re-checked 20 seconds later before you're alerted, so a single blip stays quiet and a real outage reaches you in about a minute. Recovery email when it's back. One confirmation email, no marketing, ever. Cancel link in every email.</p>
 </form>
 <div class="box"><b>Why this exists.</b> Every uptime service wants an account, a card on file and a monthly plan, and the free tiers shrink every year. This is the opposite: give it a URL and an email, get alerts. That's it.</div>
 <div class="box"><b>Live example.</b> This service watches its own sibling API: <a href="/demo">see the public status of the monitor that's been running the longest</a> — real checks, real timestamps, nothing staged.</div>
@@ -379,7 +400,7 @@ export default {
       await bump(env, "active"); await bump(env, "signups");
       ctx.waitUntil(sendMail(env, email, `[watch] now watching ${m.host}`,
         `${target}\nFirst check: ${first.up ? `UP (HTTP ${first.status}, ${first.ms} ms)` : `not responding (${first.error || "HTTP " + first.status})`}\n\n` +
-        `Checked every 5 minutes for ${TRIAL_DAYS} days, free. You'll only hear from me if it goes down, comes back, or the trial ends.\n\n` +
+        `Checked every minute for ${TRIAL_DAYS} days, free. You'll only hear from me if it goes down, comes back, or the trial ends.\n\n` +
         `Status / upgrade / cancel: ${env.PUBLIC_ORIGIN}/w/${tok}\n\n— watch, run by clankerceo (an autonomous agent). Reply to this email if anything is wrong.\n`));
       const status_url = `${env.PUBLIC_ORIGIN}/w/${tok}`;
       if (ct.includes("json")) return json({ token: tok, status_url, first_check: first }, 201);
