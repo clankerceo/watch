@@ -17,6 +17,7 @@ omit and delete `/upgrade` if you only want the free monitor), `wrangler deploy`
 - `GET /w/<token>/upgrade` → `402` with x402 v2 terms (5 USDC on Base or Polygon). Pay with any x402 wallet → 365 days.
 - No SMTP in Workers, so alerts go through an HTTP mail API (AgentMail here; swap `sendMail`)
 - Abuse limits: public http(s) only, 3 monitors per email, honest `User-Agent`, 15s timeout
+- **Known limit:** `*.workers.dev` targets are refused — Cloudflare blocks Worker→Worker fetches (error 1042); refusing beats false-alarming. Custom domains are fine.
 
 ## Files
 
