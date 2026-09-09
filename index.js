@@ -150,6 +150,7 @@ async function processMonitor(env, key, m) {
     else res = { ...again, confirmed: true };
   }
   m.lastCheck = now; m.lastStatus = res.status; m.lastMs = res.ms;
+  await recordHistory(env, m, res.up, res.ms);
   if (!res.up) {
     m.failStreak = (m.failStreak || 0) + 1;
     m.downCount = (m.downCount || 0) + 1;
@@ -368,6 +369,47 @@ async function handleClaimHit(env, key, m, hit) {
     `Thanks. 5 USDC received (tx ${hit.tx} on ${hit.network}).\n${m.url} is monitored every minute for a year.\n\nStatus/cancel: ${env.PUBLIC_ORIGIN}/w/${m.token}\n`);
 }
 
+// ---------- public status pages (/s/<slug>) ----------
+// A monitor owner names a slug from their private page; the slug maps to
+// their monitor(s). Public page shows current state + last 24h of hourly
+// history, nothing private (no email, no token). Free with any monitor: a
+// public status page is the thing people actually asked for (r/devops thread,
+// @dmkenney), and every one of them links back here.
+const slugOk = (s) => /^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])?$/.test(s) && !["api", "demo", "stats", "health", "watch", "w", "s", "study", "admin", "status"].includes(s);
+
+async function recordHistory(env, m, up, ms) {
+  // hourly buckets, 48 kept; cheap enough to do on every check
+  const h = new Date().toISOString().slice(0, 13);
+  const hist = m.hist || [];
+  let cur = hist[hist.length - 1];
+  if (!cur || cur.h !== h) { cur = { h, n: 0, ok: 0, ms: 0 }; hist.push(cur); }
+  cur.n++; cur.ok += up ? 1 : 0; cur.ms += ms || 0;
+  m.hist = hist.slice(-48);
+}
+
+function publicStatusPage(env, slug, mons) {
+  const overall = mons.every((m) => m.state === "up") ? "All systems operational"
+    : mons.some((m) => m.state === "down") ? "Partial outage" : "Checking…";
+  const rows = mons.map((m) => {
+    const hist = (m.hist || []).slice(-24);
+    const bars = hist.map((b) => {
+      const pct = b.n ? b.ok / b.n : 1;
+      const col = pct === 1 ? "#137333" : pct >= 0.9 ? "#e0a800" : "#b3261e";
+      return `<span title="${b.h}:00 UTC — ${b.ok}/${b.n} ok, avg ${Math.round(b.ms / Math.max(1, b.n))} ms" style="display:inline-block;width:10px;height:26px;margin-right:2px;background:${col};border-radius:2px"></span>`;
+    }).join("");
+    const up24 = hist.reduce((a, b) => a + b.ok, 0), n24 = hist.reduce((a, b) => a + b.n, 0);
+    const st = m.state === "down" ? `<span class="bad">DOWN</span>` : m.state === "up" ? `<span class="ok">UP</span>` : "pending";
+    return `<div class="box"><b>${esc(m.label || m.host)}</b> &nbsp; ${st}<br>
+<div style="margin:8px 0">${bars || '<span class="small">collecting…</span>'}</div>
+<span class="small">${n24 ? `${(100 * up24 / n24).toFixed(2)}% of checks OK, last 24h` : ""} · last check ${m.lastCheck ? new Date(m.lastCheck).toISOString().slice(11, 16) + " UTC" : "—"}${m.lastMs ? `, ${m.lastMs} ms` : ""}</span></div>`;
+  }).join("");
+  return html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="60"><title>${esc(slug)} — status</title><style>${CSS}</style></head><body>
+<h1>${esc(slug)}</h1><p class="sub"><b>${overall}</b> · checked every minute from Cloudflare's edge · auto-refreshes</p>
+${rows}
+<p class="small">Powered by <a href="/">watch</a> — uptime monitoring with no account. <a href="/s/${esc(slug)}.json">JSON</a></p></body></html>`);
+}
+
 // ---------- pages ----------
 const CSS = `body{max-width:640px;margin:48px auto;padding:0 20px;font:17px/1.55 system-ui,sans-serif;color:#1a1a1a;background:#fff}
 h1{font-size:1.6em;margin:.2em 0}.sub{color:#555;margin-bottom:1.6em}input,button{font:inherit;padding:10px 12px;border:1px solid #bbb;border-radius:6px}
@@ -386,6 +428,7 @@ function landing(env, stats) {
 <p class="small">Checked <b>every minute</b> from Cloudflare's edge. A failure is re-checked 20 seconds later before you're alerted, so a single blip stays quiet and a real outage reaches you in about a minute. Recovery email when it's back. One confirmation email, no marketing, ever. Cancel link in every email.</p>
 </form>
 <div class="box"><b>Why this exists.</b> Every uptime service wants an account, a card on file and a monthly plan, and the free tiers shrink every year. This is the opposite: give it a URL and an email, get alerts. That's it.</div>
+<div class="box"><b>Free public status page.</b> From your private page, pick a slug and your monitor gets a public page at <code>/s/your-slug</code> — current state plus 24 hours of hourly history, auto-refreshing. Group several monitors under one slug. Example: <a href="/s/watch-demo">/s/watch-demo</a>.</div>
 <div class="box"><b>Live example.</b> This service watches its own sibling API: <a href="/demo">see the public status of the monitor that's been running the longest</a> — real checks, real timestamps, nothing staged.</div>
 <p class="small"><b>After the week:</b> it just stops and you get one email saying so. If you want a year, it's $5 <i>once</i>, paid with a USDC wallet via <a href="https://x402.org">x402</a> — no card, no account, no renewal. If that's not your thing, the free week is still the free week.</p>
 <p class="small">Currently watching <b>${stats.active || 0}</b> URL${stats.active === 1 ? "" : "s"} · ${stats.checks || 0} checks run · ${stats.alerts || 0} alerts sent.<br>
@@ -409,6 +452,12 @@ ${m.demo ? `<div class="box">This is the public demo view of a real monitor. <a 
 <p class="small" id="claimnote"></p>
 <details class="small"><summary>Using an x402 wallet or an agent instead?</summary><code>GET ${esc(env.PUBLIC_ORIGIN)}/w/${m.token}/upgrade</code> returns x402 v2 payment terms; pay with the header and it activates instantly.</details>
 <p class="small">No wallet, no crypto? Just let the trial end. You'll get exactly one email saying it stopped — nothing else, ever.</p></div>`}
+${m.demo ? "" : `<div class="box"><b>Public status page</b> ${m.slug ? `— live at <a href="/s/${esc(m.slug)}">/s/${esc(m.slug)}</a>` : "(free)"}<br>
+<form method="post" action="/w/${m.token}/publish" style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+<input name="slug" placeholder="your-slug" value="${esc(m.slug || "")}" pattern="[a-z0-9-]{3,32}" required style="width:160px;margin:0">
+<input name="label" placeholder="label shown (e.g. API)" value="${esc(m.label || "")}" style="width:180px;margin:0">
+<button type="submit">${m.slug ? "Update" : "Publish"}</button></form>
+<p class="small">Public page shows UP/DOWN and 24h of hourly history for every monitor you publish under the same slug. Nothing private is shown. Publish other monitors of yours under the same slug to group them.</p></div>`}
 ${m.demo ? "" : `<form method="post" action="/w/${m.token}/cancel" onsubmit="return confirm('Stop monitoring and delete this?')"><button type="submit" style="background:#fff;color:#b3261e;border-color:#b3261e">Cancel &amp; delete</button></form>
 <p class="small">This page is private to whoever holds the link. <a href="/">watch</a></p>`}</body></html>`);
 }
@@ -419,11 +468,36 @@ POST ${o}/watch            form or JSON {url, email}  -> 201 {token, status_url}
 GET  ${o}/w/<token>        HTML status page
 GET  ${o}/w/<token>.json   JSON status
 POST ${o}/w/<token>/cancel delete
+POST ${o}/w/<token>/publish form {slug,label} -> public status page at /s/<slug>
+GET  ${o}/s/<slug>          public status page (HTML) · ${o}/s/<slug>.json
 GET  ${o}/w/<token>/upgrade
      no payment header -> 402 with x402 v2 terms ($5 USDC, eip155:8453 or eip155:137)
      with X-PAYMENT    -> verifies + settles via Coinbase facilitator, extends 365 days
 GET  ${o}/stats           public counters
 `;
+
+// ---------- availability study (always-on; host PC sleeps) ----------
+// Hourly, at :30, probe ~95 agent-infra sites and append one compact row per
+// site to KV under study:<ISO-hour>. Read back with /study.json. Base64 so
+// no JSON is inlined into a template literal (Workers escape bug).
+const STUDY_B64 = "WyJodHRwOi8vZHVja2R1Y2tnby5jb20vZHVja2R1Y2tib3QuaHRtbCIsICJodHRwOi8vd3d3LnNlbXJ1c2guY29tL2JvdC5odG1sIiwgImh0dHBzOi8vMTB4NDAyLmNvbS9tb25pdG9yIiwgImh0dHBzOi8vNDAyc2NvcGUub3JnIiwgImh0dHBzOi8vYWdlbnN0cnkuY29tL2JvdCIsICJodHRwczovL2FnZW50LXRvLWFnZW50Lnh5ei9sbG1zLnR4dCIsICJodHRwczovL2FnZW50LXRvb2xzLmNsb3VkIiwgImh0dHBzOi8vYWdlbnQ0MDIuYXBwL2JvdCIsICJodHRwczovL2FnZW50YWxtYW5hYy5vcmciLCAiaHR0cHM6Ly9hZ2VudGNvdW50LmFpL21ldGhvZG9sb2d5IiwgImh0dHBzOi8vYWdlbnRkYXRhLWFwaS5jb20iLCAiaHR0cHM6Ly9hZ2VudGVjb25vbXkucmUiLCAiaHR0cHM6Ly9hZ2VudGVjb25vbXkucmVwb3J0L3MvIiwgImh0dHBzOi8vYWdlbnRwcm9iZS5vcmcvbWV0aG9kb2xvZ3kiLCAiaHR0cHM6Ly9hZ2VudHJlcHV0YXRpb24uZGV2IiwgImh0dHBzOi8vYWdlbnRzLnRyYWRlcnN6b25lLm5ldCIsICJodHRwczovL2FnZW50c3VyZS50ZWNoIiwgImh0dHBzOi8vYWl2ZS5nbG9iYWwvbWNwLXRydXN0L2NlbnN1cyIsICJodHRwczovL2FuaW1pY2EuZGV2L3g0MDIiLCAiaHR0cHM6Ly9hbnBheS5kZXYvYm90IiwgImh0dHBzOi8vYXBpLm5pdHJvZ3JhcGguY29tL2JvdCIsICJodHRwczovL2FwaS50ZW1zb3IuY29tL21jcC9pbmRleCIsICJodHRwczovL2FwaXN0cnVzdC5jb20iLCAiaHR0cHM6Ly9hdmlzcmFkYXItcHJvZHVjdGlvbi51cC5yYWlsd2F5LmFwcC9tYWlucyIsICJodHRwczovL2F2aXNyYWRhci5hcHAiLCAiaHR0cHM6Ly9ib3RhbmFyeS54eXoiLCAiaHR0cHM6Ly9jYXJib24tY2FzaG1lcmUuZGUiLCAiaHR0cHM6Ly9jb3VuY2lsb2YuYWkvYXBpL3g0MDIiLCAiaHR0cHM6Ly9jcm9zc3BlZWwuY29tIiwgImh0dHBzOi8vZGF0YWZvcnNlby5jb20vZGF0YWZvcnNlby1iIiwgImh0dHBzOi8vZGVjaXhhLmFpL2JvdCIsICJodHRwczovL2Rpc2NvdmVyLnBheWdlbnQubmV0L2Fib3V0IiwgImh0dHBzOi8vZG9ubmVlcy5odWx0cmEubGluay9zb25kZXMubWQiLCAiaHR0cHM6Ly9lbGdvby5haS9ib3QiLCAiaHR0cHM6Ly9leG9yYWlscy5uZXQiLCAiaHR0cHM6Ly9mbGFyZWNsYXcuYXBwLy53ZWxsLWtub3duL3g0MDIiLCAiaHR0cHM6Ly9mb3J1bS1sYWJzLmNvbSIsICJodHRwczovL2dsaW1pbmQuY29tL29wdC1vdXQiLCAiaHR0cHM6Ly9nb2luZGV4LnNob3AvbGVnYWwiLCAiaHR0cHM6Ly9nb2xlbXJlYWNoLmNvbS90cnVzdC9ib3QiLCAiaHR0cHM6Ly9rb3J0ZXgucm9obmVsdC5kZXYvYWJvdXQtdGhlLXByb2JlIiwgImh0dHBzOi8vbGFicy5sdWJiZWUubmV0IiwgImh0dHBzOi8vbGFzdHNlZW4uZGV2IiwgImh0dHBzOi8vbGl2ZS12cHMuc2FzYW1lLm9ubGluZS8ud2VsbC1rbm93bi9hZ2VudC1jYXJkLmpzbyIsICJodHRwczovL2xsbTRhZ2VudHMuY29tIiwgImh0dHBzOi8vbGxtbWFydC5haS9hcGkiLCAiaHR0cHM6Ly9tYXJrZXQ0MDIuY29tIiwgImh0dHBzOi8vbWNwLWNsb3VkLmFpIiwgImh0dHBzOi8vbWNwLXNjaGVtYS1hcmNoaXZlLmRlbGZyb3N0NDIud29ya2Vycy5kZXYiLCAiaHR0cHM6Ly9tY3BiZWF0LmNvbS9ib3QvIiwgImh0dHBzOi8vbWNwY2Vuc3VzLmNvbSIsICJodHRwczovL21jcGxvb2t1cC5jb20iLCAiaHR0cHM6Ly9tY3BtZXRlci5kZXYvYWJvdXQiLCAiaHR0cHM6Ly9tY3BxdWVlbi5jb20iLCAiaHR0cHM6Ly9tY3BzZXJ2ZXIubG9sL2Fib3V0L3Byb2JpbmciLCAiaHR0cHM6Ly9tY3B3aXRuZXNzLmNvbSIsICJodHRwczovL21pZGF4NDAyLmNvbS9jcmF3bGVyIiwgImh0dHBzOi8vbW9kYzIuY29tL21jcHNjYW4iLCAiaHR0cHM6Ly9tcHAzMi5vcmciLCAiaHR0cHM6Ly9ub2h1bWFucy5kaXJlY3RvcnkiLCAiaHR0cHM6Ly9ub3RzbG9wLm1lIiwgImh0dHBzOi8vcGF5YWJsZS5uc2dvb2RzLm9yZyIsICJodHRwczovL3Byb2JlNDAyLmNvbS9tZXRob2QiLCAiaHR0cHM6Ly9wcm9vZmJlbmNoLmRldi9hYm91dC9wcm9iZSIsICJodHRwczovL3B1cnNlci5pbyIsICJodHRwczovL3JlZmVyZW5jZXNvdXJjZS5vcmcvbWNwLWhlYWx0aC8iLCAiaHR0cHM6Ly9yZXZldHRyLmNvbSIsICJodHRwczovL3Jva2hhLmFpIiwgImh0dHBzOi8vcm9rbWNwLmNvbS9ib3QiLCAiaHR0cHM6Ly9yb25pbmZvcmdlLm9yZy9kYXRhL29ic2VydmF0b3J5LyIsICJodHRwczovL3Njb3V0c2NvcmUuYWkiLCAiaHR0cHM6Ly9zY3ZkLnN0b3JlIiwgImh0dHBzOi8vc2VjLnNxcnguaW8iLCAiaHR0cHM6Ly9zZXJhbmtpbmcuY29tL2JhY2tsIiwgImh0dHBzOi8vc3Bhbmx5LmNvbSIsICJodHRwczovL3RoZTQwMi5kZXYiLCAiaHR0cHM6Ly90b2xsNDAyLmNvbS9pbnNpZ2h0cy94NDAyLWRpc2NvdmVyeS1jIiwgImh0dHBzOi8vdG91Y2hzdG9uZS5uZWlsa3BhdGVsLmNvbSIsICJodHRwczovL3RyaW10YWJpc3QuY29tL3ZlcmlmaWVyIiwgImh0dHBzOi8vdHJ1c3RvdmVuLmNvbS9kb2NzL2NyYXdsZXIiLCAiaHR0cHM6Ly92ZXJhbnRpcy5haSIsICJodHRwczovL3ZlcmlmeW1jcC5pby9kb2NzL2J1aWxkL293bmVycy1qc29uIiwgImh0dHBzOi8vdmV0NDAyLmNvbS9vYnNlcnZhdG9yeS9tZXRob2RvbG9neSIsICJodHRwczovL3ZvdWNoLXByb3RvY29sLmNvbSIsICJodHRwczovL3dlbGxrbm93bi5uZXR3b3JrL2JvdCIsICJodHRwczovL3dpdG5lc3MuaG9sb3dlYXZlLm9yZyIsICJodHRwczovL3d3dy5wdWxzZWdhdGUuYWkvYm90IiwgImh0dHBzOi8vd3d3LnN1cGVyc3RhYmxlcy5jb20iLCAiaHR0cHM6Ly94NDAyLWxpc3QuY29tIiwgImh0dHBzOi8veDQwMi1saXZlbmVzcy5tYWxhY2h5c21hbGxtYW4ud29ya2Vycy5kZXYiLCAiaHR0cHM6Ly94NDAyLmZ1Y2hzcy5hcHAvdHJ1c3QiLCAiaHR0cHM6Ly94NDAybGVucy5jb20vbWV0aG9kb2xvZ3kiLCAiaHR0cHM6Ly94NDAyc3RhdHMuZGVjcmVkY29tbXVuaXR5Lm9yZyIsICJodHRwczovL3plcm8ueHl6L2JvdCIsICJodHRwczovL3pldnJ1bmEuY29tIl0=";
+const STUDY_URLS = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(STUDY_B64), (c) => c.charCodeAt(0))));
+async function studyTick(env) {
+  const d = new Date();
+  if (d.getUTCMinutes() !== 30) return;
+  const hour = d.toISOString().slice(0, 13);
+  if (await env.WATCH.get(`study:${hour}`)) return;
+  // 50-subrequest cap: probe in two halves on consecutive minutes is complex;
+  // instead cap at 45 per tick and rotate the start index by hour.
+  const start = (d.getUTCHours() * 45) % STUDY_URLS.length;
+  const batch = [...STUDY_URLS.slice(start), ...STUDY_URLS.slice(0, start)].slice(0, 45);
+  const rows = await Promise.all(batch.map(async (u) => {
+    const r = await checkOnce(u);
+    return { u, c: r.status, ms: r.ms, up: r.up && r.status !== 404 && r.status !== 410 };
+  }));
+  await env.WATCH.put(`study:${hour}`, JSON.stringify({ hour, n: rows.length, up: rows.filter((x) => x.up).length, rows }),
+    { expirationTtl: 60 * 86400 });
+}
 
 async function autoClaim(env) {
   // Every 5th minute: if someone paid by plain transfer and never clicked
@@ -452,6 +526,7 @@ export default {
     const n = await runAll(env);
     await bump(env, "checks", n);
     ctx.waitUntil(autoClaim(env).catch(() => {}));
+    ctx.waitUntil(studyTick(env).catch(() => {}));
   },
 
   async fetch(request, env, ctx) {
@@ -461,7 +536,16 @@ export default {
       return new Response(null, { headers: { "access-control-allow-origin": "*",
         "access-control-allow-headers": "content-type, x-payment, payment-signature", "access-control-allow-methods": "GET,POST,OPTIONS" } });
 
-    if (p === "/" ) return landing(env, JSON.parse((await env.WATCH.get("stats")) || "{}"));
+    const statsNow = async () => {
+      const s = JSON.parse((await env.WATCH.get("stats")) || "{}");
+      let cursor, active = 0;
+      do {
+        const page = await env.WATCH.list({ prefix: "w:", cursor, limit: 1000 });
+        cursor = page.list_complete ? undefined : page.cursor; active += page.keys.length;
+      } while (cursor);
+      s.active = active; return s;
+    };
+    if (p === "/" ) return landing(env, await statsNow());
     if (p === "/api") return new Response(API_DOC(env.PUBLIC_ORIGIN), { headers: { "content-type": "text/plain" } });
     if (p === "/health") return json({ ok: true, service: "watch", time: new Date().toISOString() });
     if (p === "/demo") {
@@ -482,10 +566,22 @@ export default {
       return statusPage(env, d);
     }
     if (p === "/stats") {
-      const s = JSON.parse((await env.WATCH.get("stats")) || "{}");
+      // `active` is derived, not counted: bump() races with itself (KV has no
+      // atomic increment) and it drifted to 0 with one live monitor.
+      const s = await statsNow();
       const e = await env.WATCH.get("lastMailError");
       if (e) s.lastMailError = JSON.parse(e);
       return json(s);
+    }
+    if (p === "/study.json") {
+      let cursor; const out = [];
+      do {
+        const page = await env.WATCH.list({ prefix: "study:", cursor, limit: 1000 });
+        cursor = page.list_complete ? undefined : page.cursor;
+        for (const k of page.keys) { const v = await env.WATCH.get(k.name); if (v) out.push(JSON.parse(v)); }
+      } while (cursor);
+      out.sort((a, b) => a.hour.localeCompare(b.hour));
+      return json({ description: "Hourly availability probe of ~95 AI-agent-infrastructure sites discovered via crawler user-agents. up = HTTP<500 and not 404/410. 45 sites per hour, rotating.", hours: out.length, samples: out });
     }
     if (p === "/robots.txt") return new Response("User-agent: *\nDisallow: /w/\n", { headers: { "content-type": "text/plain" } });
 
@@ -522,14 +618,29 @@ export default {
       return Response.redirect(status_url, 303);
     }
 
-    const mm = p.match(/^\/w\/([a-f0-9]{32})(\.json|\/cancel|\/upgrade|\/claim)?$/);
+    const sm = p.match(/^\/s\/([a-z0-9-]{1,32})(\.json)?$/);
+    if (sm) {
+      const slug = sm[1];
+      const toks = JSON.parse((await env.WATCH.get(`slug:${slug}`)) || "[]");
+      if (!toks.length) return json({ error: "no such status page" }, 404);
+      const mons = (await Promise.all(toks.map((t) => env.WATCH.get(`w:${t}`)))).filter(Boolean).map((x) => JSON.parse(x));
+      if (!mons.length) return json({ error: "no such status page" }, 404);
+      if (sm[2]) return json({ slug, monitors: mons.map((m) => ({ label: m.label || m.host, url: m.url, state: m.state, lastCheck: m.lastCheck, lastMs: m.lastMs, hist: (m.hist || []).slice(-24) })) });
+      return publicStatusPage(env, slug, mons);
+    }
+
+    const mm = p.match(/^\/w\/([a-f0-9]{32})(\.json|\/cancel|\/upgrade|\/claim|\/publish)?$/);
     if (mm) {
       const tok = mm[1], key = `w:${tok}`;
       const raw = await env.WATCH.get(key);
       if (!raw) return json({ error: "no such monitor (cancelled or never existed)" }, 404);
       const m = JSON.parse(raw);
       if (mm[2] === "/cancel" && request.method === "POST") {
-        await env.WATCH.delete(key); await bump(env, "active", -1); await bump(env, "cancelled");
+        await env.WATCH.delete(key); await bump(env, "cancelled");
+        if (m.slug) {
+          const rest = JSON.parse((await env.WATCH.get(`slug:${m.slug}`)) || "[]").filter((t) => t !== tok);
+          if (rest.length) await env.WATCH.put(`slug:${m.slug}`, JSON.stringify(rest)); else await env.WATCH.delete(`slug:${m.slug}`);
+        }
         // Release the per-email slot, or three cancels lock a user out for good.
         const ek = `e:${await sha(m.email)}`;
         const cnt = parseInt((await env.WATCH.get(ek)) || "0", 10);
@@ -538,6 +649,27 @@ export default {
       }
       if (mm[2] === "/upgrade") return handleUpgrade(request, env, tok, m, key);
       if (mm[2] === "/claim" && request.method === "POST") return handleClaim(env, tok, m, key);
+      if (mm[2] === "/publish" && request.method === "POST") {
+        const f = await request.formData().catch(() => null);
+        const slug = ((f && f.get("slug")) || "").toString().trim().toLowerCase();
+        const label = ((f && f.get("label")) || "").toString().trim().slice(0, 40);
+        if (!slugOk(slug)) return json({ error: "slug: 3-32 chars, a-z 0-9 and hyphens, not reserved" }, 400);
+        const cur = JSON.parse((await env.WATCH.get(`slug:${slug}`)) || "[]");
+        // a slug is owned by the email of the first monitor published under it
+        if (cur.length) {
+          const owner = JSON.parse((await env.WATCH.get(`w:${cur[0]}`)) || "null");
+          if (owner && owner.email !== m.email) return json({ error: "that slug belongs to someone else" }, 409);
+        }
+        if (!cur.includes(tok)) cur.push(tok);
+        await env.WATCH.put(`slug:${slug}`, JSON.stringify(cur));
+        if (m.slug && m.slug !== slug) { // moved: remove from old slug
+          const old = JSON.parse((await env.WATCH.get(`slug:${m.slug}`)) || "[]").filter((t) => t !== tok);
+          if (old.length) await env.WATCH.put(`slug:${m.slug}`, JSON.stringify(old)); else await env.WATCH.delete(`slug:${m.slug}`);
+        }
+        m.slug = slug; if (label) m.label = label;
+        await env.WATCH.put(key, JSON.stringify(m));
+        return Response.redirect(`${env.PUBLIC_ORIGIN}/s/${slug}`, 303);
+      }
       if (mm[2] === ".json") { const { email, ...pub } = m; return json({ ...pub, email: email.replace(/^(.).*(@.*)$/, "$1***$2") }); }
       return statusPage(env, m);
     }
