@@ -614,6 +614,19 @@ export default {
       if (e) s.lastMailError = JSON.parse(e);
       return json(s);
     }
+    if (p === "/reliability/stale" || p === "/reliability/stale.json") {
+      const s = JSON.parse((await env.WATCH.get("study:stale")) || "null");
+      if (!s) return json({ error: "not computed yet" }, 404);
+      if (p.endsWith(".json")) return json({ ...s, definition: "registered x402 URL failed on every hourly check; the host's root page answers 2xx/3xx. Likely a moved route or stale registry entry, not a dead project.", source: "https://watch.clankerceo.workers.dev/reliability" });
+      const rows = s.hosts.map((h) => `<tr><td><a href="https://${esc(h.host)}/" rel="nofollow">${esc(h.host)}</a></td><td><code>${esc(h.path)}</code></td><td>${esc(String(h.fail))}</td><td>${h.n}</td></tr>`).join("");
+      return html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stale x402 registry entries</title><style>${CSS}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:6px 8px;border-bottom:1px solid #eee}code{font-size:12px}</style></head><body>
+<p class="small"><a href="/">watch</a> · <a href="/reliability">reliability dataset</a></p>
+<h1>Stale x402 registry entries</h1>
+<p>${s.hosts.length} hosts whose <b>registered x402 URL fails on every hourly check</b> while the <b>site itself is up</b>. That pattern is almost always a moved route or a deploy change that the registries (Bazaar, x402scan, agent-tools) never picked up — buyers discovering these services are hitting a dead path. Updated hourly; last ${esc(s.at.slice(0, 16))} UTC.</p>
+<p class="small">If you run one of these: re-index your current URL. If you run a registry: this list is free; the full per-host dataset is <a href="/reliability">here</a>.</p>
+<table><tr><th>host (root OK)</th><th>registered path</th><th>failure</th><th>checks</th></tr>${rows}</table>
+<p class="small">Method: same definition as watch — 404/410 and ≥500 count as down, 401/402/403/405 count as up. One vantage point. <a href="/reliability/preview.json">JSON preview</a> · <a href="/reliability/stale.json">this list as JSON</a>.</p></body></html>`);
+    }
     if (p === "/reliability/preview.json" || p === "/reliability.json") {
       // Aggregate the hourly study into per-host uptime. Both populations.
       const samples = await studySamples(env);
@@ -659,6 +672,7 @@ export default {
       const rows = b.rows.slice(0, 1000).map((r) => ({ u: String(r.u).slice(0, 300), c: +r.c || 0, ms: +r.ms || 0, up: !!r.up }));
       await kvPut(env, `study:${b.hour}:local`, JSON.stringify({ hour: b.hour, n: rows.length, up: rows.filter((x) => x.up).length, rows, src: "local" }), { expirationTtl: 60 * 86400 });
       await studyIdxAdd(env, `study:${b.hour}:local`);
+      if (Array.isArray(b.stale)) await kvPut(env, "study:stale", JSON.stringify({ at: new Date().toISOString(), hosts: b.stale.slice(0, 500) }));
       return json({ ok: true, stored: rows.length });
     }
     if (p === "/study.json") {
