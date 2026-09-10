@@ -482,19 +482,19 @@ ${m.demo ? `<div class="box">This is the public demo view of a real monitor. <a 
 <div class="box"><b>Want it to keep running? $5, once, for a whole year.</b>
 <p class="small" style="margin:6px 0 10px">Paid in <b>USDC</b> — a digital dollar (1 USDC = $1) — from any crypto exchange or wallet account you already have (Coinbase, Binance, Kraken, MetaMask…). No card, no account here, no renewal.</p>
 <ol class="small" style="margin:0 0 10px;padding-left:1.3em">
-<li>In your exchange or wallet, send <b>5 USDC</b> to the address below. Pick network <b>Base</b> or <b>Polygon</b>. Most exchanges charge no fee on these; if yours deducts one, send 5.10 — anything over 5 works.</li>
-<li>Come back here and tap the button. It checks the blockchain (usually confirmed within a minute) and turns this monitor on until <b>${until}</b>. You'll get a receipt email with the transaction id.</li></ol>
+<li>In your exchange or wallet, send <b>5 USDC</b> to the address below. When it asks which network to send on, choose <b>Base</b> or <b>Polygon</b> — <b>not</b> Ethereum, Solana or anything else, or the money is lost. Most exchanges charge no fee on these two; if yours deducts one, send 5.10 — anything over 5 works.</li>
+<li>Come back here and tap <b>I sent it</b>. It looks up your transfer (usually visible within a minute) and turns this monitor on until <b>${until}</b>. You'll get a receipt email.</li></ol>
 <code class="addr" id="addr">${addr}</code>
-<div class="row" style="margin:8px 0 12px"><button type="button" onclick="navigator.clipboard.writeText('${addr}');this.textContent='address copied'" style="flex:1">copy address</button></div>
+<div class="row" style="margin:8px 0 12px"><button type="button" onclick="navigator.clipboard.writeText('${addr}');this.textContent='address copied'" style="flex:1;background:#fff;color:#111;border:1px solid #111">copy address</button></div>
 <form method="post" action="/w/${m.token}/claim"><button type="submit" class="full">I sent it — activate</button></form>
-<p class="small" style="margin:8px 0 0">Sent it and it says "not seen yet"? Wait a minute and tap again. Still stuck? Reply to any watch email with your transaction id and it'll be fixed by hand.</p>
+<p class="small" style="margin:8px 0 0">Sent it and it says "not seen yet"? Wait a minute and tap again. Still stuck? Reply to any watch email with the transfer's link or id (your exchange shows it under the transfer's details) and it'll be fixed by hand.</p>
 <details class="small"><summary>Paying from an agent or x402 wallet</summary><code>GET ${esc(env.PUBLIC_ORIGIN)}/w/${m.token}/upgrade</code> returns x402 v2 terms (5 USDC, eip155:8453 or eip155:137). Pay with the header; activation is instant.</details></div>`}
 
 ${m.demo ? "" : `<div class="box"><b>Public status page</b> <span class="small">(free)</span> ${m.slug ? `— live at <a href="/s/${esc(m.slug)}">/s/${esc(m.slug)}</a>` : ""}
 <p class="small" style="margin:6px 0 10px">Get a public page showing UP/DOWN and 24 hours of history for this monitor — like the status pages big services have. Choose a short name for the web address; it becomes <code>/s/your-name</code>.</p>
 <form method="post" action="/w/${m.token}/publish" class="row">
 <input name="slug" placeholder="your-name" value="${esc(m.slug || "")}" pattern="[a-z0-9-]{3,32}" title="3-32 chars: a-z, 0-9, hyphens" required>
-<input name="label" placeholder="shown as (optional)" value="${esc(m.label || "")}">
+<input name="label" placeholder="display name" value="${esc(m.label || "")}">
 <button type="submit">${m.slug ? "Update" : "Publish"}</button></form></div>
 
 <details class="small" style="margin-top:1.4em"><summary>Delete this monitor</summary>
@@ -689,7 +689,10 @@ export default {
       // First check right now so the confirmation email carries a real result.
       const first = await checkOnce(target);
       m.checks = 1; m.lastCheck = now; m.lastStatus = first.status; m.lastMs = first.ms; m.state = first.up ? "up" : null;
-      await kvPut(env, `w:${tok}`, JSON.stringify(m));
+      // Signup is the one write that must not silently degrade: a 200 for a
+      // monitor that was never stored is worse than an honest error.
+      const stored = await kvPut(env, `w:${tok}`, JSON.stringify(m));
+      if (!stored) return json({ error: "storage is at its daily limit; please try again after 00:00 UTC. Nothing was created.", retry_after_utc: "00:00" }, 503);
       await idxAdd(env, tok);
       await kvPut(env, ek, String(cnt + 1));
       await bump(env, "active"); await bump(env, "signups");
