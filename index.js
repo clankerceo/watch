@@ -75,13 +75,13 @@ async function sendMail(env, to, subject, text) {
     });
     if (!r.ok) {
       const t = (await r.text()).slice(0, 300);
-      await env.WATCH.put("lastMailError", JSON.stringify({ at: new Date().toISOString(), status: r.status, body: t, to }));
+      await kvPut(env, "lastMailError", JSON.stringify({ at: new Date().toISOString(), status: r.status, body: t, to }));
       return false;
     }
     await bump(env, "mails");
     return true;
   } catch (e) {
-    await env.WATCH.put("lastMailError", JSON.stringify({ at: new Date().toISOString(), error: String(e?.message || e).slice(0, 300), to }));
+    await kvPut(env, "lastMailError", JSON.stringify({ at: new Date().toISOString(), error: String(e?.message || e).slice(0, 300), to }));
     return false;
   }
 }
@@ -131,7 +131,7 @@ async function processMonitor(env, key, m) {
         `Your ${m.paid ? "year" : "free trial"} of monitoring for ${m.url} has ended.\n\n` +
         `Keep it running for a year for $5 (USDC, no account): ${env.PUBLIC_ORIGIN}/w/${m.token}\n` +
         `Or ignore this and it's gone. No further emails.\n`);
-      await env.WATCH.put(key, JSON.stringify(m));
+      await kvPut(env, key, JSON.stringify(m));
     }
     return;
   }
@@ -149,6 +149,7 @@ async function processMonitor(env, key, m) {
     if (again.up) res = again;           // blip: treat as up
     else res = { ...again, confirmed: true };
   }
+  const prevState = m.state, prevStatus = m.lastStatus;
   m.lastCheck = now; m.lastStatus = res.status; m.lastMs = res.ms;
   await recordHistory(env, m, res.up, res.ms);
   if (!res.up) {
@@ -175,7 +176,15 @@ async function processMonitor(env, key, m) {
   } else if (res.up && !m.state) {
     m.state = "up";
   }
-  await env.WATCH.put(key, JSON.stringify(m));
+  // KV allows 1,000 writes/day on the free plan; writing every minute per
+  // monitor burned that by 03:xx and took the site down. Persist only when
+  // state/status changed, on the hour boundary (history bucket rolls), or
+  // every 15th check. lastCheck/lastMs may lag by up to 15 min on the private
+  // page; alerts are unaffected because they fire on state change.
+  const bucketRolled = (m.hist || []).length && (m.hist[m.hist.length - 1].n === 1);
+  if (m.state !== prevState || res.status !== prevStatus || bucketRolled || res.confirmed || (m.checks % 15) === 0) {
+    await kvPut(env, key, JSON.stringify(m));
+  }
 }
 
 // Free-plan Workers allow ~50 subrequests per invocation and each monitor
@@ -184,12 +193,7 @@ async function processMonitor(env, key, m) {
 // monitor is still checked within a few minutes and none is silently skipped.
 const PER_TICK = 20;
 async function runAll(env) {
-  let cursor; const all = [];
-  do {
-    const page = await env.WATCH.list({ prefix: "w:", cursor, limit: 1000 });
-    cursor = page.list_complete ? undefined : page.cursor;
-    for (const k of page.keys) all.push(k.name);
-  } while (cursor);
+  const all = (await idxGet(env)).map((t) => `w:${t}`);
   if (all.length <= PER_TICK) {
     await Promise.allSettled(all.map(async (k) => {
       const raw = await env.WATCH.get(k); if (raw) await processMonitor(env, k, JSON.parse(raw)); }));
@@ -202,15 +206,27 @@ async function runAll(env) {
   recs.sort((a, b) => (a[1].lastCheck || 0) - (b[1].lastCheck || 0));
   const due = recs.slice(0, PER_TICK);
   await Promise.allSettled(due.map(([k, m]) => processMonitor(env, k, m)));
-  await env.WATCH.put("stats:backlog", JSON.stringify({ monitors: recs.length, perTick: PER_TICK,
+  await kvPut(env, "stats:backlog", JSON.stringify({ monitors: recs.length, perTick: PER_TICK,
     effectiveIntervalMin: Math.ceil(recs.length / PER_TICK) }));
   return due.length;
 }
 
+// KV free tier allows 1,000 list() calls/day; a 1-minute cron alone is
+// 1,440. Took the whole site down for ~20h with "KV list() limit exceeded".
+// Keep an index of monitor tokens in a single key and never list on hot paths.
+// Wrap KV writes: quota errors must never 500 a user-facing request.
+async function kvPut(env, key, value, opts) {
+  try { await env.WATCH.put(key, value, opts); return true; }
+  catch (e) { try { await env.WATCH.put("lastKvError", JSON.stringify({ at: new Date().toISOString(), key, err: String(e?.message || e).slice(0, 160) })); } catch {} return false; }
+}
+async function idxGet(env) { return JSON.parse((await env.WATCH.get("idx:monitors")) || "[]"); }
+async function idxAdd(env, tok) { const i = await idxGet(env); if (!i.includes(tok)) { i.push(tok); await kvPut(env, "idx:monitors", JSON.stringify(i)); } }
+async function idxDel(env, tok) { const i = (await idxGet(env)).filter((t) => t !== tok); await kvPut(env, "idx:monitors", JSON.stringify(i)); }
+
 async function bump(env, field, by = 1) {
   const s = JSON.parse((await env.WATCH.get("stats")) || "{}");
   s[field] = (s[field] || 0) + by;
-  await env.WATCH.put("stats", JSON.stringify(s));
+  await kvPut(env, "stats", JSON.stringify(s));
 }
 
 // ---------- x402 payment ($5, once) ----------
@@ -271,9 +287,9 @@ async function handleUpgrade(request, env, tok, m, key) {
     return json({ error: "settlement failed", detail: s.data?.errorReason || s.data }, 402);
   const now = Date.now();
   m.paid = true; m.paidAt = now; m.tx = s.data?.transaction || null; m.network = s.data?.network || req.network;
-  if (m.tx) await env.WATCH.put(`tx:${m.tx}`, JSON.stringify({ token: tok, at: now, network: m.network, via: "x402" }));
+  if (m.tx) await kvPut(env, `tx:${m.tx}`, JSON.stringify({ token: tok, at: now, network: m.network, via: "x402" }));
   m.expiresAt = Math.max(m.expiresAt || now, now) + PAID_DAYS * 86400000; m.expiredNotified = false;
-  await env.WATCH.put(key, JSON.stringify(m));
+  await kvPut(env, key, JSON.stringify(m));
   await bump(env, "paid"); await bump(env, "revenue_cents", 500);
   await sendMail(env, m.email, `[watch] paid — ${m.host} monitored until ${new Date(m.expiresAt).toISOString().slice(0, 10)}`,
     `Thanks. $5 USDC received${m.tx ? ` (tx ${m.tx})` : ""}.\n${m.url} is monitored every minute for a year.\n\n` +
@@ -327,7 +343,7 @@ async function findUnclaimedPayment(env, sinceMs) {
         logs.push(...(part || []).reverse());   // newest first overall
         if (logs.some((l) => parseInt(l.data, 16) === 5000000)) break; // found candidates; stop paging
       }
-    } catch (e) { await env.WATCH.put("lastScanError", JSON.stringify({ network, at: new Date().toISOString(), err: String(e?.message || e).slice(0, 200) })); continue; }
+    } catch (e) { await kvPut(env, "lastScanError", JSON.stringify({ network, at: new Date().toISOString(), err: String(e?.message || e).slice(0, 200) })); continue; }
     for (const lg of logs) {
       const value = parseInt(lg.data, 16);
       if (value !== 5000000) continue;
@@ -360,10 +376,10 @@ async function handleClaim(env, tok, m, key) {
 
 async function handleClaimHit(env, key, m, hit) {
   const now = Date.now();
-  await env.WATCH.put(`tx:${hit.tx}`, JSON.stringify({ token: m.token, at: now, network: hit.network }));
+  await kvPut(env, `tx:${hit.tx}`, JSON.stringify({ token: m.token, at: now, network: hit.network }));
   m.paid = true; m.paidAt = now; m.tx = hit.tx; m.network = hit.network; m.paidVia = "transfer"; m.payer = hit.from;
   m.expiresAt = Math.max(m.expiresAt || now, now) + PAID_DAYS * 86400000; m.expiredNotified = false;
-  await env.WATCH.put(key, JSON.stringify(m));
+  await kvPut(env, key, JSON.stringify(m));
   await bump(env, "paid"); await bump(env, "revenue_cents", 500);
   await sendMail(env, m.email, `[watch] paid — ${m.host} monitored until ${new Date(m.expiresAt).toISOString().slice(0, 10)}`,
     `Thanks. 5 USDC received (tx ${hit.tx} on ${hit.network}).\n${m.url} is monitored every minute for a year.\n\nStatus/cancel: ${env.PUBLIC_ORIGIN}/w/${m.token}\n`);
@@ -438,28 +454,53 @@ Run by <a href="https://github.com/clankerceo">clankerceo</a>, an autonomous age
 
 function statusPage(env, m) {
   const left = m.expiresAt ? Math.max(0, Math.ceil((m.expiresAt - Date.now()) / 86400000)) : 0;
-  const st = m.state === "down" ? `<span class="bad">DOWN</span>` : m.state === "up" ? `<span class="ok">UP</span>` : "pending first check";
+  const ago = (t) => { if (!t) return "never"; const s = Math.round((Date.now() - t) / 1000); return s < 90 ? `${s}s ago` : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
+  const st = m.state === "down" ? `<span class="bad">DOWN</span>` : m.state === "up" ? `<span class="ok">UP</span>` : "waiting for first check";
+  const until = new Date(Date.now() + PAID_DAYS * 86400000).toISOString().slice(0, 10);
+  const addr = env.PAY_TO_BASE;
   return html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex"><title>watch — ${esc(m.host)}</title><style>${CSS}</style></head><body>
-<h1>${esc(m.host)}</h1><p class="sub"><code>${esc(m.url)}</code></p>
-<div class="box">Status: <b>${st}</b><br>Last check: ${m.lastCheck ? new Date(m.lastCheck).toISOString() : "—"} ${m.lastStatus ? `(HTTP ${m.lastStatus}, ${m.lastMs} ms)` : ""}<br>
-Checks: ${m.checks || 0} · Failed: ${m.downCount || 0} · Incidents: ${m.incidents || 0}<br>
-Plan: <b>${m.paid ? "paid, 1 year" : "free trial"}</b> · ${left} day${left === 1 ? "" : "s"} left · alerts to ${esc(m.email)}</div>
-${m.demo ? `<div class="box">This is the public demo view of a real monitor. <a href="/">Start your own</a> — free, no account.</div>` : m.paid ? "" : `<div class="box"><b>Keep it running for a year — $5, once.</b>
-<p class="small">Send <b>exactly 5 USDC</b> on <b>Base</b> or <b>Polygon</b> to this address, then click the button. Any exchange or wallet that can send USDC works (Coinbase, Binance, MetaMask, Phantom, Rabby…). No account is created here.</p>
-<p><code id="addr" style="font-size:13px;word-break:break-all">${env.PAY_TO_BASE}</code> <button type="button" onclick="navigator.clipboard.writeText('${env.PAY_TO_BASE}');this.textContent='copied'" style="padding:4px 10px;font-size:13px">copy</button></p>
-<form method="post" action="/w/${m.token}/claim"><button type="submit">I've sent 5 USDC — activate my year</button></form>
-<p class="small" id="claimnote"></p>
-<details class="small"><summary>Using an x402 wallet or an agent instead?</summary><code>GET ${esc(env.PUBLIC_ORIGIN)}/w/${m.token}/upgrade</code> returns x402 v2 payment terms; pay with the header and it activates instantly.</details>
-<p class="small">No wallet, no crypto? Just let the trial end. You'll get exactly one email saying it stopped — nothing else, ever.</p></div>`}
-${m.demo ? "" : `<div class="box"><b>Public status page</b> ${m.slug ? `— live at <a href="/s/${esc(m.slug)}">/s/${esc(m.slug)}</a>` : "(free)"}<br>
-<form method="post" action="/w/${m.token}/publish" style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
-<input name="slug" placeholder="your-slug" value="${esc(m.slug || "")}" pattern="[a-z0-9-]{3,32}" required style="width:160px;margin:0">
-<input name="label" placeholder="label shown (e.g. API)" value="${esc(m.label || "")}" style="width:180px;margin:0">
-<button type="submit">${m.slug ? "Update" : "Publish"}</button></form>
-<p class="small">Public page shows UP/DOWN and 24h of hourly history for every monitor you publish under the same slug. Nothing private is shown. Publish other monitors of yours under the same slug to group them.</p></div>`}
-${m.demo ? "" : `<form method="post" action="/w/${m.token}/cancel" onsubmit="return confirm('Stop monitoring and delete this?')"><button type="submit" style="background:#fff;color:#b3261e;border-color:#b3261e">Cancel &amp; delete</button></form>
-<p class="small">This page is private to whoever holds the link. <a href="/">watch</a></p>`}</body></html>`);
+<meta name="robots" content="noindex"><title>watch — ${esc(m.host)}</title><style>${CSS}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:15px}.kv b{font-weight:600}
+.addr{font:13px/1.4 ui-monospace,Menlo,monospace;background:#f2f2f2;padding:8px 10px;border-radius:6px;word-break:break-all;display:block}
+button.full{width:100%;padding:12px}details{margin-top:10px}summary{cursor:pointer}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row input{flex:1 1 140px;min-width:0;margin:0}</style></head><body>
+<p class="small" style="margin:0 0 6px"><a href="/">watch</a> · uptime monitor</p>
+<h1 style="word-break:break-all">${esc(m.host)}</h1>
+
+<div class="box"><div style="font-size:1.2em;margin-bottom:8px">Status: <b>${st}</b></div>
+<div class="kv">
+<b>Last check</b><span>${ago(m.lastCheck)}${m.lastStatus ? ` · HTTP ${m.lastStatus} · ${m.lastMs} ms` : ""}</span>
+<b>Checked</b><span>every minute · ${m.checks || 0} so far · ${m.incidents || 0} incident${m.incidents === 1 ? "" : "s"}</span>
+<b>Alerts to</b><span style="word-break:break-all">${esc(m.email)}</span>
+<b>Plan</b><span>${m.paid ? `paid · runs until ${new Date(m.expiresAt).toISOString().slice(0, 10)}` : `<b>free trial · ${left} day${left === 1 ? "" : "s"} left</b>`}</span>
+</div></div>
+
+${m.demo ? `<div class="box">This is the public demo view of a real monitor. <a href="/">Start your own</a> — free, no account.</div>` : m.paid ? "" : `
+<div class="box"><b>What happens when the trial ends</b>
+<p class="small" style="margin:6px 0 0">Monitoring stops and you get one email saying so. Nothing else, ever — no reminders, no marketing. If that's fine, you're done; you don't have to do anything.</p></div>
+
+<div class="box"><b>Want it to keep running? $5, once, for a whole year.</b>
+<p class="small" style="margin:6px 0 10px">Paid in <b>USDC</b> — a digital dollar (1 USDC = $1) — from any crypto exchange or wallet account you already have (Coinbase, Binance, Kraken, MetaMask…). No card, no account here, no renewal.</p>
+<ol class="small" style="margin:0 0 10px;padding-left:1.3em">
+<li>In your exchange or wallet, send <b>5 USDC</b> to the address below. Pick network <b>Base</b> or <b>Polygon</b>. Most exchanges charge no fee on these; if yours deducts one, send 5.10 — anything over 5 works.</li>
+<li>Come back here and tap the button. It checks the blockchain (usually confirmed within a minute) and turns this monitor on until <b>${until}</b>. You'll get a receipt email with the transaction id.</li></ol>
+<code class="addr" id="addr">${addr}</code>
+<div class="row" style="margin:8px 0 12px"><button type="button" onclick="navigator.clipboard.writeText('${addr}');this.textContent='address copied'" style="flex:1">copy address</button></div>
+<form method="post" action="/w/${m.token}/claim"><button type="submit" class="full">I sent it — activate</button></form>
+<p class="small" style="margin:8px 0 0">Sent it and it says "not seen yet"? Wait a minute and tap again. Still stuck? Reply to any watch email with your transaction id and it'll be fixed by hand.</p>
+<details class="small"><summary>Paying from an agent or x402 wallet</summary><code>GET ${esc(env.PUBLIC_ORIGIN)}/w/${m.token}/upgrade</code> returns x402 v2 terms (5 USDC, eip155:8453 or eip155:137). Pay with the header; activation is instant.</details></div>`}
+
+${m.demo ? "" : `<div class="box"><b>Public status page</b> <span class="small">(free)</span> ${m.slug ? `— live at <a href="/s/${esc(m.slug)}">/s/${esc(m.slug)}</a>` : ""}
+<p class="small" style="margin:6px 0 10px">Get a public page showing UP/DOWN and 24 hours of history for this monitor — like the status pages big services have. Choose a short name for the web address; it becomes <code>/s/your-name</code>.</p>
+<form method="post" action="/w/${m.token}/publish" class="row">
+<input name="slug" placeholder="your-name" value="${esc(m.slug || "")}" pattern="[a-z0-9-]{3,32}" title="3-32 chars: a-z, 0-9, hyphens" required>
+<input name="label" placeholder="shown as (optional)" value="${esc(m.label || "")}">
+<button type="submit">${m.slug ? "Update" : "Publish"}</button></form></div>
+
+<details class="small" style="margin-top:1.4em"><summary>Delete this monitor</summary>
+<form method="post" action="/w/${m.token}/cancel" onsubmit="return confirm('Stop monitoring ${esc(m.host)} and delete it? This cannot be undone.')" style="margin-top:8px"><button type="submit" style="background:#fff;color:#b3261e;border-color:#b3261e">Yes, stop and delete</button></form></details>
+<p class="small">This page is private to whoever has the link — it's your dashboard, bookmark it.</p>`}
+</body></html>`);
 }
 
 const API_DOC = (o) => `watch API
@@ -495,8 +536,19 @@ async function studyTick(env) {
     const r = await checkOnce(u);
     return { u, c: r.status, ms: r.ms, up: r.up && r.status !== 404 && r.status !== 410 };
   }));
-  await env.WATCH.put(`study:${hour}`, JSON.stringify({ hour, n: rows.length, up: rows.filter((x) => x.up).length, rows }),
+  await kvPut(env, `study:${hour}`, JSON.stringify({ hour, n: rows.length, up: rows.filter((x) => x.up).length, rows }),
     { expirationTtl: 60 * 86400 });
+  await studyIdxAdd(env, `study:${hour}`);
+}
+async function studyIdxAdd(env, key) {
+  const i = JSON.parse((await env.WATCH.get("idx:study")) || "[]");
+  if (!i.includes(key)) { i.push(key); await kvPut(env, "idx:study", JSON.stringify(i.slice(-2000))); }
+}
+async function studySamples(env) {
+  const keys = JSON.parse((await env.WATCH.get("idx:study")) || "[]");
+  const out = [];
+  for (const k of keys) { const v = await env.WATCH.get(k); if (v) out.push(JSON.parse(v)); }
+  return out;
 }
 
 async function autoClaim(env) {
@@ -504,15 +556,11 @@ async function autoClaim(env) {
   // "activate", bind the payment to the OLDEST unpaid trial monitor created
   // before the transfer. Same rule as the button, just without the button.
   if (new Date().getMinutes() % 5) return;
-  let cursor; const unpaid = [];
-  do {
-    const page = await env.WATCH.list({ prefix: "w:", cursor, limit: 1000 });
-    cursor = page.list_complete ? undefined : page.cursor;
-    for (const k of page.keys) {
-      const m = JSON.parse((await env.WATCH.get(k.name)) || "null");
-      if (m && !m.paid && m.expiresAt > Date.now() - 7 * 86400000) unpaid.push([k.name, m]);
-    }
-  } while (cursor);
+  const unpaid = [];
+  for (const t of await idxGet(env)) {
+    const m = JSON.parse((await env.WATCH.get(`w:${t}`)) || "null");
+    if (m && !m.paid && m.expiresAt > Date.now() - 7 * 86400000) unpaid.push([`w:${t}`, m]);
+  }
   if (!unpaid.length) return;
   unpaid.sort((a, b) => a[1].createdAt - b[1].createdAt);
   const hit = await findUnclaimedPayment(env, unpaid[0][1].createdAt);
@@ -524,7 +572,7 @@ async function autoClaim(env) {
 export default {
   async scheduled(event, env, ctx) {
     const n = await runAll(env);
-    await bump(env, "checks", n);
+    if (new Date().getMinutes() % 15 === 0) await bump(env, "checks", n * 15); // 1 write per 15 min, not per minute
     ctx.waitUntil(autoClaim(env).catch(() => {}));
     ctx.waitUntil(studyTick(env).catch(() => {}));
   },
@@ -538,12 +586,7 @@ export default {
 
     const statsNow = async () => {
       const s = JSON.parse((await env.WATCH.get("stats")) || "{}");
-      let cursor, active = 0;
-      do {
-        const page = await env.WATCH.list({ prefix: "w:", cursor, limit: 1000 });
-        cursor = page.list_complete ? undefined : page.cursor; active += page.keys.length;
-      } while (cursor);
-      s.active = active; return s;
+      s.active = (await idxGet(env)).length; return s;
     };
     if (p === "/" ) return landing(env, await statsNow());
     if (p === "/api") return new Response(API_DOC(env.PUBLIC_ORIGIN), { headers: { "content-type": "text/plain" } });
@@ -552,15 +595,11 @@ export default {
       // Public, read-only view of the longest-running monitor (mine). Same
       // renderer as the private page, but no cancel/upgrade controls and the
       // email masked, so nothing here is a secret.
-      let oldest = null, cursor;
-      do {
-        const page = await env.WATCH.list({ prefix: "w:", cursor, limit: 200 });
-        cursor = page.list_complete ? undefined : page.cursor;
-        for (const k of page.keys) {
-          const m = JSON.parse((await env.WATCH.get(k.name)) || "null");
-          if (m && (!oldest || m.createdAt < oldest.createdAt)) oldest = m;
-        }
-      } while (cursor);
+      let oldest = null;
+      for (const t of await idxGet(env)) {
+        const m = JSON.parse((await env.WATCH.get(`w:${t}`)) || "null");
+        if (m && (!oldest || m.createdAt < oldest.createdAt)) oldest = m;
+      }
       if (!oldest) return json({ error: "no monitors yet" }, 404);
       const d = { ...oldest, email: oldest.email.replace(/^(.).*(@.*)$/, "$1***$2"), demo: true };
       return statusPage(env, d);
@@ -569,18 +608,15 @@ export default {
       // `active` is derived, not counted: bump() races with itself (KV has no
       // atomic increment) and it drifted to 0 with one live monitor.
       const s = await statsNow();
+      const ke = await env.WATCH.get("lastKvError"); if (ke) s.lastKvError = JSON.parse(ke);
+      s.capacity_note = "free-plan KV: 1,000 writes/day; ~120/day per monitor at 1-min checks => ~7 monitors before writes are dropped (pages go stale, alerts still fire). Upgrade to paid KV at first paying customer.";
       const e = await env.WATCH.get("lastMailError");
       if (e) s.lastMailError = JSON.parse(e);
       return json(s);
     }
     if (p === "/reliability/preview.json" || p === "/reliability.json") {
       // Aggregate the hourly study into per-host uptime. Both populations.
-      let cursor; const samples = [];
-      do {
-        const page = await env.WATCH.list({ prefix: "study:", cursor, limit: 1000 });
-        cursor = page.list_complete ? undefined : page.cursor;
-        for (const k of page.keys) { const v = await env.WATCH.get(k.name); if (v) samples.push(JSON.parse(v)); }
-      } while (cursor);
+      const samples = await studySamples(env);
       const per = {};
       for (const s of samples) for (const r of s.rows) {
         const h = new URL(r.u).hostname; const o = per[h] || (per[h] = { host: h, url: r.u, n: 0, up: 0, ms: 0, codes: {} });
@@ -611,7 +647,7 @@ export default {
       const s = await facilitator(env, "settle", { x402Version: 2, paymentPayload: payload, paymentRequirements: rq });
       if (!s.ok || s.data?.success === false) return json({ error: "settlement failed", detail: s.data?.errorReason || s.data }, 402);
       await bump(env, "dataset_paid"); await bump(env, "revenue_cents", 1000);
-      if (s.data?.transaction) await env.WATCH.put(`tx:${s.data.transaction}`, JSON.stringify({ dataset: true, at: Date.now() }));
+      if (s.data?.transaction) await kvPut(env, `tx:${s.data.transaction}`, JSON.stringify({ dataset: true, at: Date.now() }));
       return json({ ...body, hosts }, 200, { "payment-response": btoa(JSON.stringify({ success: true, transaction: s.data?.transaction, network: s.data?.network })) });
     }
     if (p === "/study/ingest" && request.method === "POST") {
@@ -621,16 +657,12 @@ export default {
       const b = await request.json().catch(() => null);
       if (!b || !b.hour || !Array.isArray(b.rows)) return json({ error: "need {hour, rows[]}" }, 400);
       const rows = b.rows.slice(0, 1000).map((r) => ({ u: String(r.u).slice(0, 300), c: +r.c || 0, ms: +r.ms || 0, up: !!r.up }));
-      await env.WATCH.put(`study:${b.hour}:local`, JSON.stringify({ hour: b.hour, n: rows.length, up: rows.filter((x) => x.up).length, rows, src: "local" }), { expirationTtl: 60 * 86400 });
+      await kvPut(env, `study:${b.hour}:local`, JSON.stringify({ hour: b.hour, n: rows.length, up: rows.filter((x) => x.up).length, rows, src: "local" }), { expirationTtl: 60 * 86400 });
+      await studyIdxAdd(env, `study:${b.hour}:local`);
       return json({ ok: true, stored: rows.length });
     }
     if (p === "/study.json") {
-      let cursor; const out = [];
-      do {
-        const page = await env.WATCH.list({ prefix: "study:", cursor, limit: 1000 });
-        cursor = page.list_complete ? undefined : page.cursor;
-        for (const k of page.keys) { const v = await env.WATCH.get(k.name); if (v) out.push(JSON.parse(v)); }
-      } while (cursor);
+      const out = await studySamples(env);
       out.sort((a, b) => a.hour.localeCompare(b.hour));
       return json({ description: "Hourly availability probe of ~95 AI-agent-infrastructure sites discovered via crawler user-agents. up = HTTP<500 and not 404/410. 45 sites per hour, rotating.", hours: out.length, samples: out });
     }
@@ -657,8 +689,9 @@ export default {
       // First check right now so the confirmation email carries a real result.
       const first = await checkOnce(target);
       m.checks = 1; m.lastCheck = now; m.lastStatus = first.status; m.lastMs = first.ms; m.state = first.up ? "up" : null;
-      await env.WATCH.put(`w:${tok}`, JSON.stringify(m));
-      await env.WATCH.put(ek, String(cnt + 1));
+      await kvPut(env, `w:${tok}`, JSON.stringify(m));
+      await idxAdd(env, tok);
+      await kvPut(env, ek, String(cnt + 1));
       await bump(env, "active"); await bump(env, "signups");
       ctx.waitUntil(sendMail(env, email, `[watch] now watching ${m.host}`,
         `${target}\nFirst check: ${first.up ? `UP (HTTP ${first.status}, ${first.ms} ms)` : `not responding (${first.error || "HTTP " + first.status})`}\n\n` +
@@ -687,15 +720,15 @@ export default {
       if (!raw) return json({ error: "no such monitor (cancelled or never existed)" }, 404);
       const m = JSON.parse(raw);
       if (mm[2] === "/cancel" && request.method === "POST") {
-        await env.WATCH.delete(key); await bump(env, "cancelled");
+        await env.WATCH.delete(key); await idxDel(env, tok); await bump(env, "cancelled");
         if (m.slug) {
           const rest = JSON.parse((await env.WATCH.get(`slug:${m.slug}`)) || "[]").filter((t) => t !== tok);
-          if (rest.length) await env.WATCH.put(`slug:${m.slug}`, JSON.stringify(rest)); else await env.WATCH.delete(`slug:${m.slug}`);
+          if (rest.length) await kvPut(env, `slug:${m.slug}`, JSON.stringify(rest)); else await env.WATCH.delete(`slug:${m.slug}`);
         }
         // Release the per-email slot, or three cancels lock a user out for good.
         const ek = `e:${await sha(m.email)}`;
         const cnt = parseInt((await env.WATCH.get(ek)) || "0", 10);
-        await env.WATCH.put(ek, String(Math.max(0, cnt - 1)));
+        await kvPut(env, ek, String(Math.max(0, cnt - 1)));
         return html(`<!doctype html><meta charset="utf-8"><style>${CSS}</style><h1>Deleted.</h1><p>${esc(m.url)} is no longer monitored and its record is gone.</p><p><a href="/">watch</a></p>`);
       }
       if (mm[2] === "/upgrade") return handleUpgrade(request, env, tok, m, key);
@@ -712,13 +745,13 @@ export default {
           if (owner && owner.email !== m.email) return json({ error: "that slug belongs to someone else" }, 409);
         }
         if (!cur.includes(tok)) cur.push(tok);
-        await env.WATCH.put(`slug:${slug}`, JSON.stringify(cur));
+        await kvPut(env, `slug:${slug}`, JSON.stringify(cur));
         if (m.slug && m.slug !== slug) { // moved: remove from old slug
           const old = JSON.parse((await env.WATCH.get(`slug:${m.slug}`)) || "[]").filter((t) => t !== tok);
-          if (old.length) await env.WATCH.put(`slug:${m.slug}`, JSON.stringify(old)); else await env.WATCH.delete(`slug:${m.slug}`);
+          if (old.length) await kvPut(env, `slug:${m.slug}`, JSON.stringify(old)); else await env.WATCH.delete(`slug:${m.slug}`);
         }
         m.slug = slug; if (label) m.label = label;
-        await env.WATCH.put(key, JSON.stringify(m));
+        await kvPut(env, key, JSON.stringify(m));
         return Response.redirect(`${env.PUBLIC_ORIGIN}/s/${slug}`, 303);
       }
       if (mm[2] === ".json") { const { email, ...pub } = m; return json({ ...pub, email: email.replace(/^(.).*(@.*)$/, "$1***$2") }); }
