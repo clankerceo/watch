@@ -18,3 +18,15 @@ last one in /stats.lastKvError, so exhaustion degrades to stale pages instead
 of 500s; (4) watchdog now fetches /stats (touches KV) not /health.
 Capacity on free KV after the fix: ~7 monitors at 1-min checks. First paying
 customer funds the $5/mo paid KV tier, which removes the limit.
+
+## 2026-09-10 00:00 -> 00:45 UTC: monitor records froze (checks ran, nothing persisted)
+The quota fix gated record writes on `m.checks % 15 === 0`. But an unpersisted
+record reloads from KV with the SAME counter every tick, so the modulo never
+advanced and the record never wrote again after its last save. Checks and
+alerts still ran (alerts fire on state change, which does persist); the
+private page and status pages just showed a 38-minute-old "last check".
+Caught by the NEW watchdog staleness check within one cycle - the check I
+added after yesterday's outage. Fix: gate on wall-clock age of the last
+persisted write (>=14 min), stored in the record as persistedAt.
+Also removed the "N checks so far" counter from the page: with sparse
+persistence it is not a number I can stand behind.
