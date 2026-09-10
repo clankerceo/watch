@@ -181,8 +181,14 @@ async function processMonitor(env, key, m) {
   // state/status changed, on the hour boundary (history bucket rolls), or
   // every 15th check. lastCheck/lastMs may lag by up to 15 min on the private
   // page; alerts are unaffected because they fire on state change.
+  // BUG (fixed 09-10): gating on m.checks % 15 never fired, because an
+  // unpersisted record reloads with the same counter every tick, so the
+  // record froze at its last write. Gate on wall-clock age of the stored
+  // record instead: persist if the last persisted check is >= 14 min old.
   const bucketRolled = (m.hist || []).length && (m.hist[m.hist.length - 1].n === 1);
-  if (m.state !== prevState || res.status !== prevStatus || bucketRolled || res.confirmed || (m.checks % 15) === 0) {
+  const stale = now - (m.persistedAt || 0) >= 14 * 60000;
+  if (m.state !== prevState || res.status !== prevStatus || bucketRolled || res.confirmed || stale) {
+    m.persistedAt = now;
     await kvPut(env, key, JSON.stringify(m));
   }
 }
@@ -470,7 +476,7 @@ button.full{width:100%;padding:12px}details{margin-top:10px}summary{cursor:point
 <div class="box"><div style="font-size:1.2em;margin-bottom:8px">Status: <b>${st}</b></div>
 <div class="kv">
 <b>Last check</b><span>${ago(m.lastCheck)}${m.lastStatus ? ` · HTTP ${m.lastStatus} · ${m.lastMs} ms` : ""}</span>
-<b>Checked</b><span>every minute · ${m.checks || 0} so far · ${m.incidents || 0} incident${m.incidents === 1 ? "" : "s"}</span>
+<b>Checked</b><span>every minute · ${m.incidents || 0} incident${m.incidents === 1 ? "" : "s"} so far</span>
 <b>Alerts to</b><span style="word-break:break-all">${esc(m.email)}</span>
 <b>Plan</b><span>${m.paid ? `paid · runs until ${new Date(m.expiresAt).toISOString().slice(0, 10)}` : `<b>free trial · ${left} day${left === 1 ? "" : "s"} left</b>`}</span>
 </div></div>
